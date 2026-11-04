@@ -12,5 +12,7 @@ module.exports = {
   AdminUser: require('./AdminUser'),
   Role: require('./Role'),
   AuditLog: require('./AuditLog'),
+  GeofenceDevice: require('./GeofenceDevice'),
+  GeofenceEvent: require('./GeofenceEvent'),
   RefreshToken: require('./RefreshToken')
 };

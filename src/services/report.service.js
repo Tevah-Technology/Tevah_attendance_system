@@ -16,7 +16,7 @@ const {
   aggregateAttendanceUnits
 } = require('../utils/attendance-policy');
 
-const { getEffectiveShift } = require('./shift-assignment.service');
+const { createReportShiftResolver } = require('./shift-assignment.service');
 
 const {
   startOfDay,
@@ -464,6 +464,15 @@ async function getEmployeeAttendance(
 }
 
 
+// Optional, request-scoped performance diagnostics. No employee PII or credentials.
+const reportDiagnosticsEnabled = () =>
+  String(process.env.REPORT_DIAGNOSTICS || '').toLowerCase() === 'true';
+
+let reportDiagnosticSequence = 0;
+function reportDiagnosticLog(id, message) {
+  if (reportDiagnosticsEnabled()) console.log(`[REPORT ${id}] ${message}`);
+}
+
 // ============================================================
 // BUILD REPORT
 // ============================================================
@@ -474,6 +483,10 @@ async function buildReport({
   employeeId,
   employeeIds
 } = {}) {
+  const reportId = ++reportDiagnosticSequence;
+  const reportStartedAt = Date.now();
+  reportDiagnosticLog(reportId, 'START buildReport');
+
   const fromDate =
     startOfDay(
       from || new Date()
@@ -487,7 +500,10 @@ async function buildReport({
   const endDate =
     endOfDay(toDate);
 
+  const ruleStartedAt = Date.now();
   const attendanceRule = (await Rule.findOne().lean()) || {};
+  reportDiagnosticLog(reportId,
+    `Rule.findOne: ${Date.now() - ruleStartedAt}ms`);
   const lateThreshold = Math.max(1, Number(attendanceRule.consecutiveLateThreshold || 4));
   const lookbackDays = Math.max(30, lateThreshold * 10);
   const queryStartDate = startOfDay(fromDate);
@@ -516,6 +532,7 @@ async function buildReport({
     };
   }
 
+  const employeesStartedAt = Date.now();
   const employees =
     await Employee
       .find(employeeFilter)
@@ -524,6 +541,9 @@ async function buildReport({
       })
       .lean();
 
+  reportDiagnosticLog(reportId,
+    `Employee.find: ${Date.now() - employeesStartedAt}ms; count=${employees.length}; days=${iterateDays(queryStartDate, toDate).length}`);
+
   const rows = [];
 
   // ----------------------------------------------------------
@@ -531,13 +551,19 @@ async function buildReport({
   // ----------------------------------------------------------
 
   for (const employee of employees) {
+    const employeeStartedAt = Date.now();
+    const punchStartedAt = Date.now();
+    reportDiagnosticLog(reportId, `START employee ${employee.employeeId}`);
     const punches =
       await getEmployeeAttendance(
         employee,
         queryStartDate,
         endDate
       );
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} punches: ${Date.now() - punchStartedAt}ms; count=${punches.length}`);
 
+    const leavesStartedAt = Date.now();
     const leaves =
       await Leave.find({
         employeeId:
@@ -551,6 +577,8 @@ async function buildReport({
         approved: true
       })
       .lean();
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} leaves: ${Date.now() - leavesStartedAt}ms; count=${leaves.length}`);
 
     // --------------------------------------------------------
     // Group punches by day
@@ -606,7 +634,16 @@ async function buildReport({
     // still know whether today is the 4th consecutive late working day.
     // --------------------------------------------------------
 
+    // Preload assignment and shift data once per employee. No attendance
+    // writes are performed; daily classification rules are unchanged.
+    const shiftPreloadStartedAt = Date.now();
+    const resolveShift = await createReportShiftResolver(employee, attendanceRule);
+    reportDiagnosticLog(reportId,
+      `employee ${employee.employeeId} shift preload: ${Date.now() - shiftPreloadStartedAt}ms`);
+
     let lateStreak = 0;
+    let shiftLookupMs = 0;
+    let shiftLookupCount = 0;
 
     for (
       const date of iterateDays(
@@ -625,7 +662,15 @@ async function buildReport({
         leaveByDay.get(key) ||
         null;
 
-      const shiftContext = await getEffectiveShift(employee, date);
+      const shiftStartedAt = Date.now();
+      const shiftContext = resolveShift(date);
+      const shiftElapsedMs = Date.now() - shiftStartedAt;
+      shiftLookupMs += shiftElapsedMs;
+      shiftLookupCount++;
+      if (shiftElapsedMs > 500) {
+        reportDiagnosticLog(reportId,
+          `SLOW shift lookup ${employee.employeeId} ${dateKey(date)}: ${shiftElapsedMs}ms`);
+      }
       const row = makeDaySummary(
         date,
         dayPunches,
@@ -655,8 +700,12 @@ async function buildReport({
 
       if (date >= fromDate) rows.push(row);
     }
+    reportDiagnosticLog(reportId,
+      `DONE employee ${employee.employeeId}: total=${Date.now() - employeeStartedAt}ms; shiftLookups=${shiftLookupCount}; shiftTotal=${shiftLookupMs}ms`);
   }
 
+  reportDiagnosticLog(reportId,
+    `DONE buildReport: total=${Date.now() - reportStartedAt}ms; outputRows=${rows.length}`);
   return rows;
 }
 
@@ -805,6 +854,7 @@ function aggregate(rows) {
         : 0
   };
 }
+
 
 
 module.exports = {

@@ -83,9 +83,90 @@ async function getEffectiveShift(employee, date = new Date()) {
   };
 }
 
+
+// Read-only report optimization: preload the employee's assignments and shifts
+// once, instead of making up to four MongoDB queries for every report day.
+// The normal getEffectiveShift API above remains unchanged for live attendance.
+async function createReportShiftResolver(employee, attendanceRule = {}) {
+  const employeeId = String(employee?.employeeId || '');
+  const assignments = await ShiftAssignment.find({
+    employeeId,
+    active: true
+  }).sort({ updatedAt: -1, createdAt: -1 }).lean();
+
+  const shiftIds = new Set();
+  for (const assignment of assignments) {
+    if (assignment.shiftId) shiftIds.add(String(assignment.shiftId));
+  }
+  if (employee?.shiftId) shiftIds.add(String(employee.shiftId));
+  if (attendanceRule?.defaultShiftId) {
+    shiftIds.add(String(attendanceRule.defaultShiftId));
+  }
+
+  const shifts = shiftIds.size
+    ? await Shift.find({ _id: { $in: [...shiftIds] } }).lean()
+    : [];
+  const shiftMap = new Map(shifts.map(shift => [String(shift._id), shift]));
+
+  function findAssignmentForDate(date) {
+    const dayStart = startOfDay(date);
+    const dayEnd = endOfDay(date);
+    const weekday = projectDayNumber(date);
+    // Assignments are already sorted by updatedAt and createdAt descending.
+    // Match the existing MongoDB precedence: single date > range > recurring.
+    const single = assignments.find(a =>
+      a.assignmentType === 'single_date' &&
+      a.date != null && new Date(a.date) >= dayStart && new Date(a.date) < dayEnd
+    );
+    if (single) return single;
+
+    const range = assignments.find(a =>
+      a.assignmentType === 'date_range' &&
+      a.startDate != null && a.endDate != null &&
+      new Date(a.startDate) <= dayEnd && new Date(a.endDate) >= dayStart
+    );
+    if (range) return range;
+
+    return assignments.find(a =>
+      a.assignmentType === 'recurring' &&
+      Array.isArray(a.recurringDays) && a.recurringDays.includes(weekday) &&
+      (a.startDate == null || new Date(a.startDate) <= dayEnd) &&
+      (a.endDate == null || new Date(a.endDate) >= dayStart)
+    ) || null;
+  }
+
+  function getEffectiveShiftForDate(date) {
+    const assignment = findAssignmentForDate(date);
+    if (assignment) {
+      const shift = shiftMap.get(String(assignment.shiftId));
+      // Preserve the existing getEffectiveShift behavior for missing shifts.
+      if (shift?.active !== false) {
+        return { shift, assignment, source: assignment.assignmentType };
+      }
+    }
+
+    let shift = employee?.shiftId
+      ? shiftMap.get(String(employee.shiftId))
+      : null;
+    if (shift?.active === false) shift = null;
+    if (!shift && attendanceRule?.defaultShiftId) {
+      shift = shiftMap.get(String(attendanceRule.defaultShiftId));
+      if (shift?.active === false) shift = null;
+    }
+    return {
+      shift: shift || null,
+      assignment: null,
+      source: employee?.shiftId ? 'employee_default' : 'company_default'
+    };
+  }
+
+  return getEffectiveShiftForDate;
+}
+
 module.exports = {
   getDefaultShift,
   getAssignmentForDate,
   getEffectiveShift,
-  projectDayNumber
+  projectDayNumber,
+  createReportShiftResolver
 };

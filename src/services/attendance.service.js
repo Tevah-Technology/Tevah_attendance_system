@@ -88,7 +88,7 @@ async function getScheduledCheckoutAt(timestamp, employee = null) {
   const midday = timeOnDate(punchAt, rule.middayAutoCheckoutTime || '13:00');
   const dayEnd = timeOnDate(punchAt, rule.dayEndAutoCheckoutTime || '17:30');
 
-  if (rule.halfDayEnabled && punchAt < midday) return midday;
+  if (rule.noonAutoCheckoutEnabled !== false && punchAt < midday) return midday;
   if (punchAt < dayEnd) return dayEnd;
   return null;
 }
@@ -411,6 +411,26 @@ async function getTodayStatus(employeeId) {
     attendanceRule
   };
 }
+// Refresh only the latest punch for each employee; do not update already-closed sessions.
+// A changed noon toggle takes effect without restarting the backend.
+async function rescheduleOpenSessions() {
+  const rule = await getRule();
+  const latest = await Attendance.aggregate([
+    { $sort: { employeeId: 1, timestamp: -1, _id: -1 } },
+    { $group: { _id: '$employeeId', punch: { $first: '$$ROOT' } } },
+    { $match: { 'punch.punchType': 'IN' } }
+  ]);
+  let updated = 0;
+  for (const row of latest) {
+    const employee = await Employee.findOne({ employeeId: row._id, active: true }).lean();
+    if (!employee) continue;
+    const due = rule.autoCheckoutEnabled ? await getScheduledCheckoutAt(row.punch.timestamp, employee) : null;
+    await Attendance.updateOne({ _id: row.punch._id }, { $set: { autoCheckoutAt: due } });
+    updated++;
+  }
+  return { updated };
+}
+
 async function autoCheckoutOpenSessions(now = new Date()) {
   const rule = await getRule();
   if (!rule.autoCheckoutEnabled) return { checkedOut: 0, skipped: 0, candidates: 0, disabled: true };
@@ -441,10 +461,17 @@ async function autoCheckoutOpenSessions(now = new Date()) {
       continue;
     }
 
+    const effectiveAt = await getScheduledCheckoutAt(openPunch.timestamp, employee);
+    if (!effectiveAt || effectiveAt > now) {
+      await Attendance.updateOne({ _id: openPunch._id }, { $set: { autoCheckoutAt: effectiveAt } });
+      skipped++;
+      continue;
+    }
+
     const result = await createPunch({
       employee,
       punchType: 'OUT',
-      timestamp: new Date(openPunch.autoCheckoutAt),
+      timestamp: effectiveAt,
       source: 'AUTO',
       rawData: {
         source: 'AUTO_CHECKOUT',
@@ -537,6 +564,7 @@ module.exports = {
   webCheckOut,
   getTodayStatus,
   autoCheckoutOpenSessions,
+  rescheduleOpenSessions,
   getEmployeeShift,
   getRequiredMinutes,
   getRule,
