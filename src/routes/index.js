@@ -13,6 +13,8 @@ const leaveType = require('../controllers/leave-type.controller');
 const leaveRule = require('../controllers/leave-rule.controller');
 const holiday = require('../controllers/holiday.controller');
 const settings = require('../controllers/settings.controller');
+const geofenceSettings = require('../controllers/geofence-settings.controller');
+const autoGeofence = require('../controllers/automatic-geofence.controller');
 const dashboard = require('../controllers/dashboard.controller');
 const system = require('../controllers/system.controller');
 const auth = require('../controllers/auth.controller');
@@ -47,8 +49,22 @@ router.get('/me/profile', p('self.profile.view'), me.profile);
 router.put('/me/profile', p('self.profile.edit'), me.updateProfile);
 router.get('/me/attendance', p('self.attendance.view'), me.attendance);
 router.get('/me/attendance/status', p('self.attendance.view'), attendance.selfStatus);
+router.get('/me/attendance/config', p('self.attendance.view'), async (req, res) => {
+  try {
+    const rule = await require('../services/attendance.service').getRule();
+    res.json({ success: true, webLocationRequired: rule.webLocationRequired === true || rule.geofenceEnabled === true, baseWebLocationRequired: rule.webLocationRequired === true, geofenceEnabled: rule.geofenceEnabled === true, geofenceCheckIn: rule.geofenceCheckIn !== false, geofenceCheckOut: rule.geofenceCheckOut !== false });
+  } catch (error) { res.status(500).json({ success: false, message: 'Unable to read attendance configuration' }); }
+});
 router.post('/me/attendance/check-in', p('self.attendance.checkin'), attendance.selfCheckIn);
 router.post('/me/attendance/check-out', p('self.attendance.checkout'), attendance.selfCheckOut);
+// Event-driven mobile geofencing; not a browser polling endpoint.
+router.get('/me/geofence/status', p('self.attendance.view'), autoGeofence.status);
+router.post('/me/geofence/register', p('self.attendance.view'), autoGeofence.register);
+router.post('/me/geofence/disable', p('self.attendance.view'), autoGeofence.disable);
+router.post('/me/geofence/event', requireAnyPermission('self.attendance.checkin','self.attendance.checkout'), autoGeofence.event);
+router.post('/me/geofence/confirm-exit', p('self.attendance.checkout'), autoGeofence.confirm);
+router.get('/me/geofence/history', p('self.attendance.view'), autoGeofence.history);
+
 router.get('/me/leaves', p('self.leave.view'), me.leaves);
 router.get('/me/leave-summary', p('self.leave.view'), me.leaveSummary);
 
@@ -81,6 +97,9 @@ router.get('/system/info', p('system.view'), system.info);
 // ============================================================
 router.get('/settings', p('settings.view'), settings.get);
 router.put('/settings', p('settings.edit'), settings.update);
+router.get('/settings/geofence', p('settings.attendance.view'), geofenceSettings.get);
+router.put('/settings/geofence', p('settings.attendance.edit'), geofenceSettings.update);
+router.post('/settings/geofence/test', p('settings.attendance.view'), geofenceSettings.test);
 router.get('/settings/:section', settings.getSection);
 router.put('/settings/:section', settings.updateSection);
 

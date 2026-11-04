@@ -822,7 +822,12 @@ async function selfCheckIn(req, res) {
       });
     }
 
+    const locationRule = await attendanceService.getRule();
+    const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'in');
+    const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckIn(employeeId, {
+      location,
+      ...(geofence ? {geofence} : {}),
       accountId: String(req.user?._id || ''),
       ip: req.ip,
       userAgent: req.get('user-agent') || ''
@@ -857,7 +862,12 @@ async function selfCheckOut(req, res) {
       });
     }
 
+    const locationRule = await attendanceService.getRule();
+    const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'out');
+    const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckOut(employeeId, {
+      location,
+      ...(geofence ? {geofence} : {}),
       accountId: String(req.user?._id || ''),
       ip: req.ip,
       userAgent: req.get('user-agent') || ''
