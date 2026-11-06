@@ -32,6 +32,10 @@ const shiftSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // Optional per-shift lunch boundary overrides; global Rules are fallback.
+    lunchStartTime: { type: String, default: '', trim: true },
+    lunchEndTime: { type: String, default: '', trim: true },
+
     // Canonical attendance fields
     breakMinutes: {
       type: Number,

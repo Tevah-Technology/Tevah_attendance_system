@@ -3,11 +3,12 @@ const {
   Attendance,
   Shift,
   Rule,
-  Leave
+  Leave,
+  Compensation
 } = require('../models');
 
 const {
-  buildIntervals
+  buildIntervals, analyzePunchSequence
 } = require('../utils/punches');
 
 const {
@@ -68,7 +69,8 @@ function makeDaySummary(
   shift,
   leave,
   attendanceRule = {},
-  shiftContext = {}
+  shiftContext = {},
+  approvedCompensations = []
 ) {
   const sorted = [...punches]
     .filter((punch) => punch && punch.timestamp)
@@ -79,6 +81,7 @@ function makeDaySummary(
     );
 
   const intervals = buildIntervals(sorted);
+  const sequenceAnomalies = analyzePunchSequence(sorted);
 
   const workedMinutes = intervals.reduce(
     (sum, item) =>
@@ -86,6 +89,59 @@ function makeDaySummary(
     0
   );
 
+  // Actual biometric work remains distinct from administratively credited time.
+  const creditedMinutes = approvedCompensations.filter(c => c.type !== 'LATE_ARRIVAL' && c.creditMode !== 'SEPARATE')
+    .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
+  const missingHoursCompensationMinutes = approvedCompensations.filter(c => c.type === 'MISSING_HOURS' && c.creditMode !== 'SEPARATE')
+    .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
+  const transferredInMinutes = approvedCompensations.filter(c => c.type === 'EXTRA_HOURS_TRANSFER')
+    .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
+  const approvedLateMinutes = approvedCompensations.filter(c => c.type === 'LATE_ARRIVAL')
+    .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
+  const separateAdjustmentMinutes = approvedCompensations.filter(c => c.creditMode === 'SEPARATE')
+    .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
+  // Distinguish physical work, paid break credit and post-shift sessions.
+  // A paid lunch isn't a biometric work interval or overtime.
+  const shiftStartBoundary = atTime(date, shift?.startTime || attendanceRule.morningStartTime || '09:00');
+  const shiftEndBoundary = atTime(date, shift?.endTime || attendanceRule.dayEndAutoCheckoutTime || '17:30');
+  if (shiftEndBoundary <= shiftStartBoundary) shiftEndBoundary.setDate(shiftEndBoundary.getDate() + 1);
+  const lunchStartBoundary = atTime(date, shift?.lunchStartTime || attendanceRule.middayAutoCheckoutTime || '13:00');
+  const lunchEndBoundary = atTime(date, shift?.lunchEndTime || attendanceRule.afternoonStartTime || '13:30');
+  const validLunch = lunchStartBoundary > shiftStartBoundary && lunchEndBoundary > lunchStartBoundary && lunchEndBoundary < shiftEndBoundary;
+  const overlapMinutes = (a, b, c, d) => Math.max(0, Math.round((Math.min(b,d)-Math.max(a,c))/60000));
+  const nowForReport = new Date();
+  const physicalRegularMinutes = intervals.reduce((sum, it) => it.open ? sum : sum +
+    overlapMinutes(new Date(it.in), new Date(it.out), shiftStartBoundary, shiftEndBoundary), 0);
+  const postShiftWorkedMinutes = intervals.reduce((sum, it) =>
+    it.open ? sum : sum + Math.max(0, Math.round(
+      (new Date(it.out) - new Date(Math.max(new Date(it.in).getTime(), shiftEndBoundary.getTime()))) / 60000
+    )), 0);
+  // Historical unresolved sessions are not presumed to be attended hours.
+  // Overtime that was automatically ended must be explicitly inspected by approver.
+  const autoCheckoutOvertimeMinutes = intervals.reduce((sum, it) =>
+    it.open || !it.autoCheckout ? sum : sum + Math.max(0, Math.round(
+      (new Date(it.out) - new Date(Math.max(new Date(it.in).getTime(), shiftEndBoundary.getTime()))) / 60000
+    )), 0);
+  const crossesLunch = validLunch && intervals.some(it => new Date(it.in) < lunchStartBoundary &&
+    new Date(it.out || nowForReport) >= lunchEndBoundary);
+  const bothSidesLunch = validLunch &&
+    intervals.some(it => new Date(it.in) < lunchStartBoundary && new Date(it.out || nowForReport) >= lunchStartBoundary) &&
+    intervals.some(it => new Date(it.in) < shiftEndBoundary && new Date(it.out || nowForReport) > lunchEndBoundary);
+  const paidLunchMinutes = attendanceRule.paidLunchEnabled && validLunch &&
+    intervals.some(it => !it.open && new Date(it.in) < lunchStartBoundary && new Date(it.out) >= lunchStartBoundary) &&
+    intervals.some(it => !it.open && new Date(it.in) < shiftEndBoundary && new Date(it.out) > lunchEndBoundary) &&
+    (crossesLunch || bothSidesLunch)
+    ? Math.round((lunchEndBoundary-lunchStartBoundary)/60000) : 0;
+  // If auto checkout is disabled, an uninterrupted IN interval covers lunch;
+  // remove the non-working lunch from physical time before crediting paid lunch.
+  const lunchOverlapWorkedMinutes = attendanceRule.paidLunchEnabled && validLunch ?
+    intervals.reduce((sum,it) => it.open ? sum : sum + overlapMinutes(new Date(it.in), new Date(it.out),
+      lunchStartBoundary, lunchEndBoundary), 0) : 0;
+  const regularWorkedMinutes = Math.max(0, physicalRegularMinutes - lunchOverlapWorkedMinutes);
+  const regularCreditedMinutes = regularWorkedMinutes + paidLunchMinutes;
+  const effectiveWorkedMinutes = attendanceRule.postShiftOvertimeEnabled || attendanceRule.paidLunchEnabled
+    ? regularCreditedMinutes + postShiftWorkedMinutes + creditedMinutes
+    : workedMinutes + creditedMinutes;
   const policy = getAttendancePolicy(attendanceRule);
   const completedIntervals = intervals.filter(item => !item.open);
   const halfDayIntervals = completedIntervals.filter(item => {
@@ -94,7 +150,7 @@ function makeDaySummary(
   }).length;
 
   let attendanceClassification = classifyDay({
-    workedMinutes,
+    workedMinutes: effectiveWorkedMinutes,
     completedIntervals: completedIntervals.length,
     hasOpenInterval: intervals.some(item => item.open)
   }, policy);
@@ -105,19 +161,29 @@ function makeDaySummary(
   // Date-specific shifts are evaluated against that shift's own required minutes
   // and credit value. This lets an approved 16:15-20:15 half shift count as
   // 0.5 day without changing the company-wide 09:00-17:30 rules.
-  if (isDateSpecificShift && shift && !hasOpenInterval) {
+  if (shift && !hasOpenInterval) {
     const required = Math.max(1, Number(shift.requiredMinutes || policy.fullDayMinutes || 480));
     const maxUnits = Math.max(0, Math.min(1, Number(shift.attendanceUnits ?? 1)));
 
-    if (workedMinutes >= required) {
+    if (effectiveWorkedMinutes >= required) {
       attendanceClassification = maxUnits >= 1
         ? { status: 'FULL_DAY', label: 'Full Day', attendanceUnits: 1, halfDay: false, fullDay: true, halfDayEligible: true }
         : maxUnits >= 0.5
           ? { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true }
           : { status: 'INCOMPLETE', label: 'Incomplete', attendanceUnits: 0, halfDay: false, fullDay: false, halfDayEligible: false };
-    } else if (maxUnits >= 1 && workedMinutes >= Math.min(policy.halfDayMinutes, required)) {
+    } else if (maxUnits >= 1 && effectiveWorkedMinutes >= Math.min(policy.halfDayMinutes, required)) {
       attendanceClassification = { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true };
     }
+  }
+
+  // For standard shifts, explicit approved credits can complete an otherwise
+  // incomplete day; preserve old split-session logic when no credits exist.
+  if (creditedMinutes > 0 && !hasOpenInterval && !shift) {
+    attendanceClassification = classifyDay({
+      workedMinutes: effectiveWorkedMinutes,
+      completedIntervals: Math.max(1, completedIntervals.length),
+      hasOpenInterval: false
+    }, policy);
   }
 
   if (policy.halfDayEnabled && policy.twoHalfDaysEqualOneDay && halfDayIntervals >= 2) {
@@ -135,7 +201,7 @@ function makeDaySummary(
   // configured morning/afternoon sessions rather than requiring exactly 480
   // worked minutes. This preserves the 09:30 grace window: an employee who
   // checks in at 09:20 and completes both sessions is still a full day.
-  if (attendanceRule.halfDayEnabled !== false && !isDateSpecificShift) {
+  if (attendanceRule.halfDayEnabled !== false && !shift && creditedMinutes === 0) {
     const morningStart = atTime(date, attendanceRule.morningStartTime || '09:00');
     const midday = atTime(date, attendanceRule.middayAutoCheckoutTime || '13:00');
     const afternoonStart = atTime(date, attendanceRule.afternoonStartTime || '13:30');
@@ -179,7 +245,7 @@ function makeDaySummary(
   // ----------------------------------------------------------
 
   let lateCutoff = atTime(date, attendanceRule.lateAfterTime || '09:30');
-  if (isDateSpecificShift && shift?.startTime) {
+  if (shift?.startTime) {
     lateCutoff = atTime(date, shift.startTime);
     lateCutoff.setMinutes(lateCutoff.getMinutes() + Math.max(0, Number(shift.graceMinutes || 0)));
   }
@@ -188,7 +254,7 @@ function makeDaySummary(
     : 0;
 
   const lateCompensationMinutes = firstInPunch
-    ? Math.max(0, Number(firstInPunch.lateCompensationMinutes || 0))
+    ? Math.max(0, Number(firstInPunch.lateCompensationMinutes || 0) + approvedLateMinutes)
     : 0;
 
   const lateMinutes = Math.max(
@@ -232,16 +298,14 @@ function makeDaySummary(
   // OVERTIME
   // ----------------------------------------------------------
 
-  const overtimeLimit = Number(
-    shift?.overtimeAfterMinutes ??
-      shift?.requiredMinutes ??
-      480
-  );
-
-  const overtimeMinutes = Math.max(
-    0,
-    workedMinutes - overtimeLimit
-  );
+  const requiredRegularMinutes = Number(shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480);
+  const fullRegularShift = regularCreditedMinutes >= requiredRegularMinutes;
+  const overtimeMinimum = Math.max(0, Number(shift?.minimumOvertimeMinutes ?? attendanceRule.minimumOvertimeMinutes ?? 0));
+  const overtimeMinutes = attendanceRule.postShiftOvertimeEnabled
+    ? (attendanceRule.overtimeEnabled !== false &&
+      (!attendanceRule.overtimeRequiresFullRegularShift || fullRegularShift) &&
+      postShiftWorkedMinutes >= overtimeMinimum ? postShiftWorkedMinutes : 0)
+    : Math.max(0, workedMinutes - Number(shift?.overtimeAfterMinutes ?? shift?.requiredMinutes ?? 480));
 
   // ----------------------------------------------------------
   // WORKING DAY
@@ -276,13 +340,41 @@ function makeDaySummary(
 
   if (leave) {
     status = 'LEAVE';
-  } else if (sorted.length > 0) {
+  } else if (sorted.length > 0 || creditedMinutes > 0) {
     status = 'PRESENT';
   } else if (workingDay) {
     status = 'ABSENT';
   } else {
     status = 'OFF';
   }
+
+  // Clock state is separate from attendance status. "PRESENT" means the
+  // employee attended the day, not that their session is currently open.
+  // Use the actual, timestamp-ordered IN/OUT records; do not infer a checkout
+  // from firstIn/lastOut, which may both point to the same device punch.
+  const typedPunches = sorted.filter(p =>
+    p.punchType === 'IN' || p.punchType === 'OUT'
+  );
+  const latestTypedPunch = typedPunches.length
+    ? typedPunches[typedPunches.length - 1]
+    : null;
+  const isToday = dateKey(date) === dateKey(new Date());
+  let clockState = 'UNKNOWN';
+  if (leave) {
+    clockState = 'ON_LEAVE';
+  } else if (!latestTypedPunch) {
+    if (status === 'ABSENT') clockState = 'NOT_CLOCKED_IN';
+  } else if (latestTypedPunch.punchType === 'OUT') {
+    clockState = 'CLOCKED_OUT';
+  } else if (isToday && hasOpenInterval) {
+    clockState = 'CLOCKED_IN';
+  }
+  // An unmatched IN on a previous day is not proof that the employee
+  // remains clocked in today: it may indicate a missing or unsynced OUT.
+  const checkedIn = clockState === 'CLOCKED_IN'
+    ? true
+    : (clockState === 'CLOCKED_OUT' || clockState === 'NOT_CLOCKED_IN'
+        ? false : null);
 
   return {
     date: startOfDay(date),
@@ -300,6 +392,14 @@ function makeDaySummary(
       employee.designation || '',
 
     status,
+
+    // Authoritative self-attendance state for Daily Attendance Console.
+    clockState,
+    checkedIn,
+    hasOpenSession: isToday ? hasOpenInterval : false,
+    lastPunchType: latestTypedPunch?.punchType || null,
+    latestPunchType: latestTypedPunch?.punchType || null,
+    punchesSorted: true,
 
     // Detailed day classification used by the frontend/reports.
     attendanceDayStatus: attendanceClassification.status,
@@ -322,7 +422,26 @@ function makeDaySummary(
 
     intervals,
 
-    workedMinutes,
+    workedMinutes, // physical work, includes after-shift sessions
+    regularWorkedMinutes,
+    paidLunchMinutes,
+    regularCreditedMinutes,
+    postShiftWorkedMinutes,
+    fullRegularShift,
+    overtimeSessionCount: intervals.filter(it => !it.open && new Date(it.out) > shiftEndBoundary).length,
+    autoCheckoutOvertimeMinutes,
+    verifiedOvertimeMinutes: Math.max(0, overtimeMinutes - autoCheckoutOvertimeMinutes),
+    unverifiedOvertimeMinutes: Math.min(overtimeMinutes, autoCheckoutOvertimeMinutes),
+    sequenceAnomalies,
+    requiresAttendanceReview: sequenceAnomalies.length > 0 || hasOpenInterval,
+    creditedMinutes,
+    separateAdjustmentMinutes,
+    effectiveWorkedMinutes,
+    missingHoursCompensationMinutes,
+    transferredInMinutes,
+    transferredOutMinutes: 0, // filled by report-builder from approved source-day transfers
+    availableOvertimeMinutes: overtimeMinutes, // admin approval of transfer verifies auto-closed sessions
+    approvedCompensations: approvedCompensations.map(c => ({ id: c._id, type: c.type, creditMode: c.creditMode || 'MERGE', minutes: c.minutes, sourceDate: c.sourceDate })),
 
     breakMinutes,
 
@@ -331,7 +450,7 @@ function makeDaySummary(
     lateCompensationMinutes,
 
     lateCompensationReason:
-      firstInPunch?.lateCompensationReason || '',
+      [firstInPunch?.lateCompensationReason, ...approvedCompensations.filter(c => c.type === 'LATE_ARRIVAL').map(c => c.reason)].filter(Boolean).join(' | '),
 
     lateCompensatedAt:
       firstInPunch?.lateCompensatedAt || null,
@@ -342,7 +461,7 @@ function makeDaySummary(
     lateMinutes,
 
     lateByRule,
-    lateCutoffTime: isDateSpecificShift && shift?.startTime ? lateCutoff.toTimeString().slice(0, 5) : (attendanceRule.lateAfterTime || '09:30'),
+    lateCutoffTime: shift?.startTime ? lateCutoff.toTimeString().slice(0, 5) : (attendanceRule.lateAfterTime || '09:30'),
     consecutiveLateCount: 0,
     latePenaltyApplied: false,
 
@@ -544,6 +663,23 @@ async function buildReport({
   reportDiagnosticLog(reportId,
     `Employee.find: ${Date.now() - employeesStartedAt}ms; count=${employees.length}; days=${iterateDays(queryStartDate, toDate).length}`);
 
+  const compensationEmployeeIds = employees.map(e => e.employeeId);
+  const approved = compensationEmployeeIds.length ? await Compensation.find({
+    employeeId: { $in: compensationEmployeeIds }, status: 'APPROVED',
+    $or: [ { date: { $gte: dateKey(queryStartDate), $lte: dateKey(toDate) } },
+           { type: 'EXTRA_HOURS_TRANSFER', sourceDate: { $gte: dateKey(queryStartDate), $lte: dateKey(toDate) } } ]
+  }).lean() : [];
+  const creditsByDay = new Map();
+  const transferOutByDay = new Map();
+  for (const c of approved) {
+    const key = `${c.employeeId}|${c.date}`;
+    if (!creditsByDay.has(key)) creditsByDay.set(key, []);
+    creditsByDay.get(key).push(c);
+    if (c.type === 'EXTRA_HOURS_TRANSFER') {
+      const sourceKey = `${c.employeeId}|${c.sourceDate}`;
+      transferOutByDay.set(sourceKey, (transferOutByDay.get(sourceKey) || 0) + c.minutes);
+    }
+  }
   const rows = [];
 
   // ----------------------------------------------------------
@@ -678,8 +814,11 @@ async function buildReport({
         shiftContext.shift,
         leave,
         attendanceRule,
-        shiftContext
+        shiftContext,
+        creditsByDay.get(`${employee.employeeId}|${key}`) || []
       );
+      row.transferredOutMinutes = transferOutByDay.get(`${employee.employeeId}|${key}`) || 0;
+      row.availableOvertimeMinutes = Math.max(0, row.overtimeMinutes - row.transferredOutMinutes);
 
       // OFF days (for example Sunday) do not break a late-arrival streak.
       if (row.status === 'PRESENT' && row.lateByRule) {
@@ -754,6 +893,11 @@ function aggregate(rows) {
       0
     );
 
+  const totalCreditedMinutes = safeRows.reduce((sum, row) => sum + Number(row.creditedMinutes || 0), 0);
+  const totalEffectiveWorkingMinutes = safeRows.reduce((sum, row) => sum + Number(row.effectiveWorkedMinutes || row.workedMinutes || 0), 0);
+  const totalTransferredOutMinutes = safeRows.reduce((sum, row) => sum + Number(row.transferredOutMinutes || 0), 0);
+  const totalAvailableOvertimeMinutes = safeRows.reduce((sum, row) => sum + Number(row.availableOvertimeMinutes || 0), 0);
+  const totalLateCompensationMinutes = safeRows.reduce((sum, row) => sum + Number(row.lateCompensationMinutes || 0), 0);
   const totalOvertimeMinutes =
     presentRows.reduce(
       (sum, row) =>
@@ -832,6 +976,11 @@ function aggregate(rows) {
     earlyCheckoutDays,
 
     totalWorkingMinutes,
+    totalCreditedMinutes,
+    totalEffectiveWorkingMinutes,
+    totalTransferredOutMinutes,
+    totalAvailableOvertimeMinutes,
+    totalLateCompensationMinutes,
 
     totalBreakMinutes,
 

@@ -20,7 +20,7 @@ const attendanceSchema = new mongoose.Schema({
   // AUTO = automatic checkout, MANUAL_ADMIN = administrator correction.
   source: {
     type: String,
-    enum: ['DEVICE', 'WEB', 'AUTO', 'MANUAL_ADMIN'],
+    enum: ['DEVICE', 'WEB', 'AUTO', 'AUTO_LUNCH_RETURN', 'MANUAL_ADMIN'],
     default: 'DEVICE',
     index: true
   },
@@ -30,6 +30,8 @@ const attendanceSchema = new mongoose.Schema({
 
   // Groups an IN/OUT pair into the same attendance session.
   sessionId: { type: String, default: '', index: true },
+  // Stable key for synthetic checkout retries across scheduler workers.
+  autoEventKey: { type: String, default: null },
 
   // Useful for the UI and reports without changing historical punch data.
   isAutoCheckout: { type: Boolean, default: false },
@@ -53,6 +55,7 @@ const attendanceSchema = new mongoose.Schema({
 // WEB/AUTO use a synthetic deviceIp so they coexist with F28 records.
 attendanceSchema.index({ deviceIp: 1, userId: 1, timestamp: 1 }, { unique: true });
 attendanceSchema.index({ employeeId: 1, timestamp: 1 });
+attendanceSchema.index({ autoEventKey: 1 }, { unique: true, partialFilterExpression: { autoEventKey: { $type: 'string' } }, name: 'unique_auto_event_per_open_session' });
 attendanceSchema.index({ employeeId: 1, punchType: 1, timestamp: -1 });
 
 module.exports = mongoose.model('Attendance', attendanceSchema);

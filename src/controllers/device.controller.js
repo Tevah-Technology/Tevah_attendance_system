@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const deviceService = require('../services/device.service');
 const { syncAttendance } = require('../services/attendance.service');
 const { Employee } = require('../models');
@@ -116,6 +117,26 @@ async function attendanceDiagnostics(req, res) {
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
+}
+
+// Three independently sampled clocks for the Terminal Clock frontend.
+// Device times are decoded in the device's local wall-clock timezone.
+async function clockComparison(req, res) {
+  const serverTime = new Date().toISOString();
+  const [mongo, device] = await Promise.allSettled([
+    mongoose.connection.db.admin().command({ hello: 1 }),
+    deviceService.getTime()
+  ]);
+  res.json({
+    success: true,
+    serverTime,
+    mongoTime: mongo.status === 'fulfilled' && mongo.value.localTime
+      ? new Date(mongo.value.localTime).toISOString() : null,
+    mongoError: mongo.status === 'rejected' ? 'MongoDB server clock unavailable' : null,
+    deviceTime: device.status === 'fulfilled' ? device.value : null,
+    deviceError: device.status === 'rejected' ? 'ZKTeco F28 clock unavailable' : null,
+    sampledAt: new Date().toISOString()
+  });
 }
 
 async function time(req, res) {
@@ -258,6 +279,7 @@ module.exports = {
   attendance,
   attendanceDiagnostics,
   time,
+  clockComparison,
   setTime,
   sync,
   syncUsers

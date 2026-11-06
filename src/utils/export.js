@@ -13,6 +13,13 @@ function flatten(rows) {
     LastPunch: row.lastPunch ? new Date(row.lastPunch).toLocaleTimeString() : '',
     AllPunches: row.punches.map((p) => `${new Date(p.timestamp).toLocaleTimeString()} ${p.punchType}`).join(' | '),
     WorkingHours: formatMinutes(row.workedMinutes),
+    ApprovedCreditHours: formatMinutes(row.creditedMinutes || 0),
+    CreditedWorkingHours: formatMinutes(row.effectiveWorkedMinutes ?? row.workedMinutes),
+    MissingHoursCredit: formatMinutes(row.missingHoursCompensationMinutes || 0),
+    TransferredIn: formatMinutes(row.transferredInMinutes || 0),
+    TransferredOut: formatMinutes(row.transferredOutMinutes || 0),
+    AvailableOvertime: formatMinutes(row.availableOvertimeMinutes ?? row.overtimeMinutes),
+    ApprovedLateMinutes: row.lateCompensationMinutes || 0,
     BreakDuration: formatMinutes(row.breakMinutes),
     LateMinutes: row.lateMinutes,
     EarlyDepartureMinutes: row.earlyDepartureMinutes,
@@ -56,7 +63,7 @@ function toPdf(rows) {
       doc.fontSize(8).text(
         `First: ${row.firstPunch ? new Date(row.firstPunch).toLocaleTimeString() : '-'}  ` +
         `Last: ${row.lastPunch ? new Date(row.lastPunch).toLocaleTimeString() : '-'}  ` +
-        `Work: ${formatMinutes(row.workedMinutes)}  Break: ${formatMinutes(row.breakMinutes)}  ` +
+        `Actual: ${formatMinutes(row.workedMinutes)}  Credit: ${formatMinutes(row.creditedMinutes || 0)}  Credited: ${formatMinutes(row.effectiveWorkedMinutes ?? row.workedMinutes)}  Break: ${formatMinutes(row.breakMinutes)}  ` +
         `Late: ${row.lateMinutes}m  Early: ${row.earlyDepartureMinutes}m  OT: ${formatMinutes(row.overtimeMinutes)}`
       );
       doc.moveDown(0.6);

@@ -38,6 +38,12 @@ async function login(req, res) {
     const password = String(req.body.password || '');
     if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required' });
     const key = attemptKey(req, email);
+    // Discard stale throttling entries; never retain failed-login keys indefinitely.
+    if (attempts.size > 5000) {
+      for (const [k, entry] of attempts) {
+        if (entry.lockedUntil < Date.now()) attempts.delete(k);
+      }
+    }
     const existing = attempts.get(key);
     const settings = await Settings.findOne({ key: 'system' }).select('security').lean();
     const maxAttempts = Math.max(1, Number(settings?.security?.maxLoginAttempts || 5));
@@ -105,7 +111,7 @@ async function register(req, res) {
   let createdUser = null;
 
   try {
-    const registrationEnabled = String(process.env.PUBLIC_REGISTRATION_ENABLED ?? 'true')
+    const registrationEnabled = String(process.env.PUBLIC_REGISTRATION_ENABLED ?? 'false')
       .trim()
       .toLowerCase() !== 'false';
 

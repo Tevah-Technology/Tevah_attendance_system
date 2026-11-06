@@ -304,6 +304,15 @@ function normalizeShiftBody(body = {}) {
 // ============================================================
 
 function validate(body = {}) {
+  for (const key of ['lunchStartTime', 'lunchEndTime']) {
+    if (body[key] !== undefined && body[key] !== '' && !isValidTime(body[key]))
+      return `${key} must be HH:mm`;
+  }
+  if (body.lunchStartTime && body.lunchEndTime) {
+    const minutes = x => Number(x.slice(0,2)) * 60 + Number(x.slice(3,5));
+    if (minutes(body.lunchStartTime) >= minutes(body.lunchEndTime))
+      return 'lunchEndTime must be later than lunchStartTime';
+  }
 
   if (
     body.startTime !== undefined &&

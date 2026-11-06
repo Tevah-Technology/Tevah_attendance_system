@@ -408,6 +408,8 @@ async function weekly(req, res) {
           fullDayDays: stats.fullDayDays,
           attendanceEquivalentDays: stats.attendanceEquivalentDays,
           workMinutes: stats.totalWorkingMinutes,
+          creditedMinutes: stats.totalCreditedMinutes,
+          effectiveWorkMinutes: stats.totalEffectiveWorkingMinutes,
           breakMinutes: stats.totalBreakMinutes,
           overtimeMinutes: stats.totalOvertimeMinutes,
         };
@@ -481,6 +483,9 @@ async function monthly(req, res) {
           designation: row.designation || '',
           daily: [],
           workMinutes: 0,
+          creditedMinutes: 0,
+          effectiveWorkMinutes: 0,
+          transferredOutMinutes: 0,
           overtimeMinutes: 0,
           breakMinutes: 0,
           presentDays: 0,
@@ -523,6 +528,10 @@ async function monthly(req, res) {
         firstIn: row.firstIn || null,
         lastOut: row.lastOut || null,
         workedMinutes: Number(row.workedMinutes || 0),
+        creditedMinutes: Number(row.creditedMinutes || 0),
+        effectiveWorkedMinutes: Number(row.effectiveWorkedMinutes || row.workedMinutes || 0),
+        transferredInMinutes: Number(row.transferredInMinutes || 0),
+        transferredOutMinutes: Number(row.transferredOutMinutes || 0),
         breakMinutes: Number(row.breakMinutes || 0),
         overtimeMinutes: Number(row.overtimeMinutes || 0),
         lateMinutes: Number(row.lateMinutes || 0),
@@ -532,6 +541,9 @@ async function monthly(req, res) {
       });
 
       employee.workMinutes += Number(row.workedMinutes || 0);
+      employee.creditedMinutes += Number(row.creditedMinutes || 0);
+      employee.effectiveWorkMinutes += Number(row.effectiveWorkedMinutes || row.workedMinutes || 0);
+      employee.transferredOutMinutes += Number(row.transferredOutMinutes || 0);
       employee.overtimeMinutes += Number(row.overtimeMinutes || 0);
       employee.breakMinutes += Number(row.breakMinutes || 0);
       employee.attendanceUnits += Number(row.attendanceUnits || 0);
@@ -699,6 +711,8 @@ async function department(req, res) {
           fullDayDays: stats.fullDayDays,
           attendanceEquivalentDays: stats.attendanceEquivalentDays,
           workMinutes: stats.totalWorkingMinutes,
+          creditedMinutes: stats.totalCreditedMinutes,
+          effectiveWorkMinutes: stats.totalEffectiveWorkingMinutes,
           breakMinutes: stats.totalBreakMinutes,
           overtimeMinutes: stats.totalOvertimeMinutes,
         };

@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const { config, createDevice } = require('../config/zkteco');
-const { Attendance, Employee, Shift, Rule } = require('../models');
+const { Attendance, Employee, Shift, Rule, RejectedPunch, EmployeePunchLock } = require('../models');
 const { stateToPunchType, verificationLabel, attendanceStateLabel } = require('../utils/punches');
 const { startOfDay, endOfDay } = require('../utils/time');
 const { getAttendancePolicy, classifyDay } = require('../utils/attendance-policy');
@@ -67,30 +67,46 @@ function timeOnDate(date, hhmm) {
   return d;
 }
 
+async function getShiftBoundaries(employee, timestamp, rule = null) {
+  rule = rule || await getRule();
+  const at = new Date(timestamp);
+  const effective = employee?.employeeId ? await getEffectiveShift(employee, at) : null;
+  const shift = effective?.shift || null;
+  const shiftStart = timeOnDate(at, shift?.startTime || rule.morningStartTime || '09:00');
+  const shiftEnd = timeOnDate(at, shift?.endTime || rule.dayEndAutoCheckoutTime || '17:30');
+  if (shiftEnd <= shiftStart) shiftEnd.setDate(shiftEnd.getDate() + 1);
+  const lunchStart = timeOnDate(at, shift?.lunchStartTime || rule.middayAutoCheckoutTime || '13:00');
+  const lunchEnd = timeOnDate(at, shift?.lunchEndTime || rule.afternoonStartTime || '13:30');
+  const lunchValid = lunchStart > shiftStart && lunchEnd > lunchStart && lunchEnd < shiftEnd;
+  return { shift, shiftSource: effective?.source || null, shiftStart, shiftEnd, lunchStart, lunchEnd, lunchValid };
+}
+
 async function getScheduledCheckoutAt(timestamp, employee = null) {
   const rule = await getRule();
-  if (!rule.autoCheckoutEnabled) return null;
-
   const punchAt = new Date(timestamp);
-
-  if (employee?.employeeId) {
-    const effective = await getEffectiveShift(employee, punchAt);
-    const isDateSpecific = ['single_date', 'date_range', 'recurring'].includes(String(effective?.source || ''));
-    if (isDateSpecific && effective?.shift?.endTime) {
-      let shiftEnd = timeOnDate(punchAt, effective.shift.endTime);
-      const shiftStart = timeOnDate(punchAt, effective.shift.startTime || '00:00');
-      if (shiftEnd <= shiftStart) shiftEnd.setDate(shiftEnd.getDate() + 1);
-      if (punchAt < shiftEnd) return shiftEnd;
-      return null;
-    }
+  const t = await getShiftBoundaries(employee, punchAt, rule);
+  // Overtime re-entry after the regular shift is limited independently.
+  if (rule.overtimeAutoCheckoutEnabled && punchAt >= t.shiftEnd) {
+    return new Date(punchAt.getTime() + Number(rule.overtimeSessionLimitMinutes || 120) * 60000);
   }
-
-  const midday = timeOnDate(punchAt, rule.middayAutoCheckoutTime || '13:00');
-  const dayEnd = timeOnDate(punchAt, rule.dayEndAutoCheckoutTime || '17:30');
-
-  if (rule.noonAutoCheckoutEnabled !== false && punchAt < midday) return midday;
-  if (punchAt < dayEnd) return dayEnd;
+  if (!rule.autoCheckoutEnabled) return null;
+  if (rule.noonAutoCheckoutEnabled !== false && t.lunchValid && punchAt < t.lunchStart)
+    return t.lunchStart;
+  if (rule.shiftEndAutoCheckoutEnabled || ['single_date','date_range','recurring'].includes(t.shiftSource)) {
+    if (punchAt < t.shiftEnd) return t.shiftEnd;
+  } else {
+    const legacyEnd = timeOnDate(punchAt, rule.dayEndAutoCheckoutTime || '17:30');
+    if (punchAt < legacyEnd) return legacyEnd;
+  }
   return null;
+}
+
+async function isBlockedLunchIn(employee, timestamp) {
+  const rule = await getRule();
+  if (!rule.lunchClockInBlocked) return false;
+  const boundaries = await getShiftBoundaries(employee, timestamp, rule);
+  const at = new Date(timestamp);
+  return boundaries.lunchValid && at >= boundaries.lunchStart && at < boundaries.lunchEnd;
 }
 
 async function getRequiredMinutes(employee, date = new Date()) {
@@ -127,7 +143,36 @@ async function emit(record) {
   }
 }
 
-async function createPunch({
+// Guards state transitions across multiple PM2 workers and schedulers.
+// A failed lock must not silently discard terminal data: polling will retry it.
+async function withPunchLock(employeeId, callback) {
+  const owner = crypto.randomUUID();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30000);
+  try {
+    await EmployeePunchLock.findOneAndUpdate(
+      { employeeId: String(employeeId), expiresAt: { $lte: now } },
+      { $set: { owner, expiresAt }, $setOnInsert: { employeeId: String(employeeId) } },
+      { upsert: true, new: true, runValidators: true }
+    );
+  } catch (err) {
+    if (err.code === 11000) {
+      const busy = new Error('Employee attendance is being updated; retry');
+      busy.statusCode = 409;
+      throw busy;
+    }
+    throw err;
+  }
+  try { return await callback(); }
+  finally { await EmployeePunchLock.deleteOne({ employeeId: String(employeeId), owner }); }
+}
+
+async function createPunch(args) {
+  if (!args?.employee?.employeeId) throw new Error('Employee profile is required');
+  return withPunchLock(args.employee.employeeId, () => createPunchUnlocked(args));
+}
+
+async function createPunchUnlocked({
   employee,
   punchType,
   timestamp = new Date(),
@@ -150,6 +195,9 @@ async function createPunch({
   if (!employee?.employeeId) throw new Error('Employee profile is required');
 
   const employeeId = String(employee.employeeId);
+  if (punchType === 'IN' && await isBlockedLunchIn(employee, timestamp)) {
+    return { blocked: true, reason: 'LUNCH_CLOCK_IN_BLOCKED', timestamp: new Date(timestamp) };
+  }
   const resolvedUserId = String(userId ?? employee.deviceUserId ?? employeeId);
   const previous = await getLatestEmployeePunch(employeeId);
   const active = isActivePunch(previous);
@@ -183,7 +231,7 @@ async function createPunch({
   }
 
   const recordData = {
-    deviceIp: source === 'DEVICE' ? config.ip : source === 'AUTO' ? 'SYSTEM' : 'WEB',
+    deviceIp: source === 'DEVICE' ? config.ip : ['AUTO','AUTO_LUNCH_RETURN'].includes(source) ? 'SYSTEM' : 'WEB',
     userId: resolvedUserId,
     userSn: userSn == null ? (employee.deviceUid ?? null) : userSn,
     employeeId,
@@ -200,7 +248,12 @@ async function createPunch({
     source,
     autoCheckoutAt,
     sessionId: resolvedSessionId,
-    isAutoCheckout: Boolean(isAutoCheckout)
+    isAutoCheckout: Boolean(isAutoCheckout),
+    autoEventKey: isAutoCheckout && rawData?.closedFromAttendanceId
+      ? `AUTO_OUT:${String(rawData.closedFromAttendanceId)}`
+      : source === 'AUTO_LUNCH_RETURN'
+        ? `AUTO_LUNCH_RETURN:${employeeId}:${new Date(timestamp).toISOString()}`
+        : null
   };
 
   try {
@@ -209,11 +262,12 @@ async function createPunch({
     return { inserted: true, record: record.toObject() };
   } catch (error) {
     if (error.code === 11000) {
-      const duplicate = await Attendance.findOne({
-        deviceIp: recordData.deviceIp,
-        userId: recordData.userId,
-        timestamp: recordData.timestamp
-      }).lean();
+      const duplicate = await Attendance.findOne(recordData.autoEventKey
+        ? { $or: [{ autoEventKey: recordData.autoEventKey }, {
+            deviceIp: recordData.deviceIp, userId: recordData.userId, timestamp: recordData.timestamp
+          }] }
+        : { deviceIp: recordData.deviceIp, userId: recordData.userId, timestamp: recordData.timestamp }
+      ).lean();
       return { duplicate: true, record: duplicate };
     }
     throw error;
@@ -235,12 +289,30 @@ async function saveAttendanceLog(rawLog, options = {}) {
   let punchType = options.punchType || null;
   if (!punchType && hasExplicitState) punchType = stateToPunchType(normalized.state, 0);
   if (!punchType) {
-    const previousAtTime = await getLatestEmployeePunch(employeeId, normalized.timestamp);
-    punchType = previousAtTime?.punchType === 'IN' ? 'OUT' : 'IN';
+    const laterAtTime = await Attendance.exists({ employeeId, timestamp: { $gt: normalized.timestamp } });
+    if (laterAtTime) {
+      // Don't guess whether a delayed terminal punch is IN or OUT after
+      // synthetic/checkpoint punches exist. Preserve raw evidence for review.
+      punchType = 'UNKNOWN';
+    } else {
+      const previousAtTime = await getLatestEmployeePunch(employeeId, normalized.timestamp);
+      punchType = previousAtTime?.punchType === 'IN' ? 'OUT' : 'IN';
+    }
   }
 
   if (!employee) {
     console.warn(`F28 punch received for unlinked user ${normalized.userId}; saving it as employee ${employeeId}`);
+  }
+
+  if (punchType === 'IN' && await isBlockedLunchIn(employee || { employeeId }, normalized.timestamp)) {
+    try {
+      await RejectedPunch.updateOne(
+        { deviceIp: config.ip, userId: normalized.userId, timestamp: normalized.timestamp },
+        { $setOnInsert: { deviceIp: config.ip, userId: normalized.userId,
+          employeeId, timestamp: normalized.timestamp, attemptedPunchType: 'IN',
+          reason: 'LUNCH_CLOCK_IN_BLOCKED', rawData: normalized.rawData } }, { upsert: true });
+    } catch (error) { if (error.code !== 11000) throw error; }
+    return { skipped: 1, blocked: true, reason: 'LUNCH_CLOCK_IN_BLOCKED' };
   }
 
   return createPunch({
@@ -281,6 +353,11 @@ async function webCheckIn(employeeId, metadata = {}) {
     }
   }
 
+  if (await isBlockedLunchIn(employee, new Date())) {
+    const error = new Error('Clock-in is not allowed during the configured lunch break');
+    error.statusCode = 409;
+    throw error;
+  }
   return createPunch({
     employee,
     punchType: 'IN',
@@ -399,8 +476,23 @@ async function getTodayStatus(employeeId) {
   } catch (error) {
     console.error('Today attendance classification error:', error.message);
   }
+  const boundaries = await getShiftBoundaries(employee, new Date(), attendanceRule);
+  const lastPunchToday = punches.length ? punches[punches.length - 1] : null;
+  const now = new Date();
+  const afterLunch = boundaries.lunchValid && now >= boundaries.lunchEnd && now < boundaries.shiftEnd;
+  const morningIN = punches.some(p => p.punchType === 'IN' && p.timestamp < boundaries.lunchStart);
+  const lunchReturnWarning = afterLunch && morningIN && !active;
+  const overtimeSessionActive = active && lastPunchToday?.punchType === 'IN' &&
+    new Date(lastPunchToday.timestamp) >= boundaries.shiftEnd;
   return {
     employeeId: employee.employeeId,
+    lunchReturnWarning,
+    lunchReturnWarningText: lunchReturnWarning ? 'You have not clocked in after lunch. Please clock in to resume work.' : null,
+    regularShiftEnd: boundaries.shiftEnd,
+    overtimeSessionActive,
+    overtimeAutoCheckoutAt: overtimeSessionActive ? (latest?.autoCheckoutAt || null) : null,
+    attendanceNotice: overtimeSessionActive ? 'Overtime active. Your session will close at its configured limit.' :
+      now >= boundaries.shiftEnd ? 'Your regular shift has ended. Clock in again if you are continuing overtime.' : null,
     employeeName: employee.name,
     checkedIn: active,
     status: active ? 'IN_OFFICE' : (punches.length ? 'CHECKED_OUT' : 'NOT_CHECKED_IN'),
@@ -441,7 +533,7 @@ async function rescheduleOpenSessions() {
   for (const row of latest) {
     const employee = await Employee.findOne({ employeeId: row._id, active: true }).lean();
     if (!employee) continue;
-    const due = rule.autoCheckoutEnabled ? await getScheduledCheckoutAt(row.punch.timestamp, employee) : null;
+    const due = await getScheduledCheckoutAt(row.punch.timestamp, employee);
     await Attendance.updateOne({ _id: row.punch._id }, { $set: { autoCheckoutAt: due } });
     updated++;
   }
@@ -450,7 +542,7 @@ async function rescheduleOpenSessions() {
 
 async function autoCheckoutOpenSessions(now = new Date()) {
   const rule = await getRule();
-  if (!rule.autoCheckoutEnabled) return { checkedOut: 0, skipped: 0, candidates: 0, disabled: true };
+  if (!rule.autoCheckoutEnabled && !rule.overtimeAutoCheckoutEnabled) return { checkedOut: 0, skipped: 0, candidates: 0, disabled: true };
 
   const candidates = await Attendance.find({
     punchType: 'IN',
@@ -508,6 +600,35 @@ async function autoCheckoutOpenSessions(now = new Date()) {
   return { checkedOut, skipped, candidates: candidates.length };
 }
 
+// Scheduler runs at the system's configured lunch end. Uses the exact configured
+// boundary (not the scheduler execution time) and only resumes an AUTO lunch OUT.
+async function autoLunchReturn(now = new Date()) {
+  const rule = await getRule();
+  if (!rule.autoLunchReturnEnabled || !rule.noonAutoCheckoutEnabled || !rule.autoCheckoutEnabled)
+    return { inserted: 0, disabled: true };
+  const employees = await Employee.find({ active: true }).lean();
+  let inserted = 0, skipped = 0;
+  for (const employee of employees) {
+    const t = await getShiftBoundaries(employee, now, rule);
+    if (!t.lunchValid || now < t.lunchEnd || now >= t.shiftEnd) continue;
+    // Catch a missed run only in the small immediate post-lunch window.
+    if (now.getTime() - t.lunchEnd.getTime() > 5 * 60000) continue;
+    const latest = await getLatestEmployeePunch(employee.employeeId);
+    if (!latest || latest.punchType !== 'OUT' || latest.source !== 'AUTO' ||
+        latest.timestamp < t.lunchStart || latest.timestamp >= t.lunchEnd) { skipped++; continue; }
+    const first = await Attendance.findOne({ employeeId: employee.employeeId,
+      punchType: 'IN', timestamp: { $gte: t.shiftStart, $lt: t.lunchStart } }).lean();
+    if (!first) { skipped++; continue; }
+    const result = await createPunch({ employee, punchType: 'IN', timestamp: t.lunchEnd,
+      source: 'AUTO_LUNCH_RETURN', userId: employee.deviceUserId || employee.employeeId,
+      userSn: employee.deviceUid,
+      rawData: { source: 'AUTO_LUNCH_RETURN', verifiedOnSite: false,
+        note: 'System-time return; not proof of biometric/geofence presence' } });
+    if (result.inserted) inserted++;
+  }
+  return { inserted, skipped };
+}
+
 async function syncAttendance() {
   const deviceService = require('./device.service');
   const logs = await deviceService.getAttendanceLogs();
@@ -559,16 +680,22 @@ async function syncAttendance() {
 async function startRealtimeListener() {
   if (String(process.env.ZK_REALTIME).toLowerCase() !== 'true') return null;
   const device = createDevice();
-  await device.createSocket();
-  if (typeof device.getRealTimeLogs !== 'function') {
+  try {
+    await device.createSocket();
+    if (typeof device.getRealTimeLogs !== 'function') {
+      throw new Error('getRealTimeLogs is not available in this node-zklib build');
+    }
+    await device.getRealTimeLogs((log) => {
+      saveAttendanceLog(log).catch((error) =>
+        console.error('Realtime attendance error:', error.message));
+    });
+    console.log('ZKTeco real-time attendance listener started');
+    return device;
+  } catch (error) {
+    // Prevent a half-open listener from surviving failed setup.
     try { await device.disconnect(); } catch (_) {}
-    throw new Error('getRealTimeLogs is not available in this node-zklib build');
+    throw error;
   }
-  await device.getRealTimeLogs((log) => {
-    saveAttendanceLog(log).catch((error) => console.error('Realtime attendance error:', error.message));
-  });
-  console.log('ZKTeco real-time attendance listener started');
-  return device;
 }
 
 module.exports = {
@@ -581,6 +708,8 @@ module.exports = {
   webCheckOut,
   getTodayStatus,
   autoCheckoutOpenSessions,
+  autoLunchReturn,
+  getShiftBoundaries,
   rescheduleOpenSessions,
   getEmployeeShift,
   getRequiredMinutes,
