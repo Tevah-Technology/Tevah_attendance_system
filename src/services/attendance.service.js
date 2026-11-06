@@ -266,6 +266,21 @@ async function webCheckIn(employeeId, metadata = {}) {
   const employee = await Employee.findOne({ employeeId: String(employeeId), active: true }).lean();
   if (!employee) throw new Error('Active employee profile not found');
 
+  // Catch up an overdue scheduled checkout for this employee before deciding
+  // whether today's new IN is a duplicate. The periodic scheduler may not have
+  // run yet, e.g. immediately after a server restart.
+  const lastPunch = await getLatestEmployeePunch(employee.employeeId);
+  if (isActivePunch(lastPunch)) {
+    const due = await getScheduledCheckoutAt(lastPunch.timestamp, employee);
+    if (due && due <= new Date()) {
+      await createPunch({
+        employee, punchType: 'OUT', timestamp: due, source: 'AUTO',
+        sessionId: lastPunch.sessionId, isAutoCheckout: true, force: true,
+        rawData: { source: 'AUTO_CHECKOUT', reason: 'Overdue scheduled checkout reconciled before web check-in', closedFromAttendanceId: String(lastPunch._id) }
+      });
+    }
+  }
+
   return createPunch({
     employee,
     punchType: 'IN',
@@ -300,7 +315,9 @@ async function getTodayStatus(employeeId) {
   const to = endOfDay(new Date());
   const punches = await Attendance.find({ employeeId: employee.employeeId, timestamp: { $gte: from, $lt: to } })
     .sort({ timestamp: 1, _id: 1 }).lean();
-  const latest = punches[punches.length - 1] || null;
+  // Match the global latest-punch rule used by createPunch. Today's punches
+  // alone would incorrectly show CHECKED OUT while yesterday's IN is still open.
+  const latest = await getLatestEmployeePunch(employee.employeeId);
   const active = isActivePunch(latest);
   const firstIn = punches.find(p => p.punchType === 'IN') || null;
   const lastOut = [...punches].reverse().find(p => p.punchType === 'OUT') || null;
