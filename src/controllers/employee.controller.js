@@ -333,46 +333,62 @@ async function create(req, res) {
 async function update(req, res) {
   try {
     if (!(await assertEmployeeAllowed(req, req.params.id))) return res.status(403).json({ success: false, message: 'Employee is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
-    const employee = await Employee.findOneAndUpdate(
-      {
-        employeeId: req.params.id
-      },
-      {
-        $set: req.body
-      },
-      {
-        new: true,
-        runValidators: true
-      }
-    );
 
-    if (!employee) {
-      return res.status(404).json({
-        success: false,
-        message: 'Employee not found'
-      });
+    const original = await Employee.findOne({ employeeId: req.params.id });
+    if (!original) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    // An employee's personnel email and their application login email must not
+    // diverge when edited from the employee details screen.
+    const changes = { ...(req.body || {}) };
+    const login = await AdminUser.findOne({ employeeId: original.employeeId });
+    const oldLoginEmail = login?.email;
+    if (Object.prototype.hasOwnProperty.call(changes, 'email')) {
+      const email = String(changes.email ?? '').trim().toLowerCase();
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ success: false, message: 'A valid email address is required' });
+      }
+      if (login && !email) {
+        return res.status(400).json({ success: false, message: 'Email cannot be empty while the employee has a login account' });
+      }
+      if (login && email !== login.email) {
+        const existing = await AdminUser.findOne({ email, _id: { $ne: login._id } }).lean();
+        if (existing) return res.status(409).json({ success: false, message: 'Email is already used by another login account' });
+      }
+      changes.email = email;
     }
 
-    // Keep an existing application login aligned with personnel status/name.
-    // Email/password changes remain explicit through /employees/:id/login.
-    const login = await AdminUser.findOne({ employeeId: employee.employeeId });
-    if (login) {
-      login.name = employee.name;
-      if (req.body.active != null) login.active = employee.active !== false;
+    // Save the unique-indexed login first, so a conflicting email never causes
+    // the employee edit to appear successful when it isn't.
+    if (login && changes.email !== undefined && changes.email !== login.email) {
+      login.email = changes.email;
       await login.save();
     }
 
-    res.json({
-      success: true,
-      message: 'Employee updated successfully',
-      employee,
-      login: publicLoginAccount(login)
-    });
+    let employee;
+    try {
+      employee = await Employee.findOneAndUpdate(
+        { employeeId: req.params.id }, { $set: changes }, { new: true, runValidators: true }
+      );
+      if (!employee) throw new Error('Employee not found during update');
+    } catch (error) {
+      if (login && oldLoginEmail && login.email !== oldLoginEmail) {
+        login.email = oldLoginEmail;
+        await login.save().catch(rollbackError => console.error('Login email rollback failed:', rollbackError));
+      }
+      throw error;
+    }
 
+    if (login) {
+      login.name = employee.name;
+      if (changes.active != null) login.active = employee.active !== false;
+      await login.save();
+    }
+
+    return res.json({ success: true, message: 'Employee updated successfully', employee, login: publicLoginAccount(login) });
   } catch (error) {
-    res.status(400).json({
+    return res.status(error?.code === 11000 ? 409 : 400).json({
       success: false,
-      message: error.message
+      message: error?.code === 11000 ? 'Email is already used by another login account' : error.message
     });
   }
 }
