@@ -1,5 +1,6 @@
 const { Employee, Attendance, Leave } = require('../models');
 const { getTodayStatus } = require('../services/attendance.service');
+const { buildReport } = require('../services/report.service');
 const { getEmployeeLeaveBalances, getLeaveHistory } = require('../services/leave.service');
 
 async function profile(req, res) {
@@ -24,6 +25,52 @@ async function attendance(req, res) {
   const status = await getTodayStatus(req.user.employeeId);
   res.json({ success: true, count: rows.length, data: rows, todayStatus: status });
 }
+
+// Employee-scoped daily attendance summary. Unlike /me/attendance, this endpoint
+// includes approved MERGE compensation credits using the same report engine
+// used by admin compensation dashboards. Identity comes ONLY from the token.
+async function attendanceDaily(req, res) {
+  try {
+    const employeeId = String(req.user?.employeeId || '').trim();
+    if (!employeeId) return res.status(404).json({ success: false, message: 'Employee profile is not linked to this account' });
+    const valid = /^\d{4}-\d{2}-\d{2}$/;
+    const fromText = String(req.query.from || '');
+    const toText = String(req.query.to || '');
+    if (!valid.test(fromText) || !valid.test(toText)) {
+      return res.status(400).json({ success: false, message: 'from and to must be YYYY-MM-DD' });
+    }
+    const from = new Date(`${fromText}T12:00:00`);
+    const to = new Date(`${toText}T12:00:00`);
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) ||
+        from.getFullYear() !== Number(fromText.slice(0,4)) ||
+        to.getFullYear() !== Number(toText.slice(0,4)) || from > to ||
+        (to - from) > 370 * 86400000) {
+      return res.status(400).json({ success: false, message: 'Invalid attendance date range (maximum 370 days)' });
+    }
+    const rows = await buildReport({ from, to, employeeId, employeeIds: [employeeId] });
+    const data = rows.filter(row => String(row.employeeId) === employeeId).map(row => ({
+      date: row.date,
+      employeeId,
+      firstIn: row.firstIn,
+      lastOut: row.lastOut,
+      status: row.status,
+      workedMinutes: Number(row.workedMinutes || 0),
+      creditedMinutes: Number(row.creditedMinutes || 0),
+      separateAdjustmentMinutes: Number(row.separateAdjustmentMinutes || 0),
+      effectiveWorkedMinutes: Number(row.effectiveWorkedMinutes ?? row.workedMinutes ?? 0),
+      requiredMinutes: Number(row.requiredMinutes || 0),
+      missingMinutes: Math.max(0, Number(row.requiredMinutes || 0) - Number(row.effectiveWorkedMinutes ?? row.workedMinutes ?? 0)),
+      overtimeMinutes: Number(row.overtimeMinutes || 0),
+      lateMinutes: Number(row.lateMinutes || 0),
+      earlyOutMinutes: Number(row.earlyDepartureMinutes || 0),
+    }));
+    return res.json({ success: true, data, count: data.length });
+  } catch (error) {
+    console.error('[Employee daily attendance] failed:', error);
+    return res.status(500).json({ success: false, message: 'Unable to calculate employee daily attendance' });
+  }
+}
+
 async function leaves(req, res) {
   const year = Number(req.query.year || new Date().getFullYear());
   const [rows, balance] = await Promise.all([
@@ -57,4 +104,4 @@ async function leaveSummary(req, res) {
         : null
   });
 }
-module.exports = { profile, updateProfile, attendance, leaves, leaveSummary };
+module.exports = { profile, updateProfile, attendance, attendanceDaily, leaves, leaveSummary };

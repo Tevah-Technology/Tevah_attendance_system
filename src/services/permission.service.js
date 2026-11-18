@@ -15,7 +15,7 @@ async function getEffectiveAccess(user) {
   const roleCode = String(user?.role || role?.code || 'EMPLOYEE').toUpperCase();
   const permissions = roleCode === 'SUPER_ADMIN'
     ? ALL_PERMISSIONS
-    : (role?.permissions?.length ? role.permissions : (rolePermissions[roleCode] || []));
+    : (Array.isArray(role?.permissions) ? role.permissions : (rolePermissions[roleCode] || []));
   return {
     role,
     roleCode,

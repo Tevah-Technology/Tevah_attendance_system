@@ -1,5 +1,7 @@
 module.exports = {
   Attendance: require('./Attendance'),
+  EmployeePunchLock: require('./EmployeePunchLock'),
+  RejectedPunch: require('./RejectedPunch'),
   Employee: require('./Employee'),
   Leave: require('./Leave'),
   LeaveType: require('./LeaveType'),
@@ -12,6 +14,9 @@ module.exports = {
   AdminUser: require('./AdminUser'),
   Role: require('./Role'),
   AuditLog: require('./AuditLog'),
+  Compensation: require('./Compensation'),
+  OvertimeBalance: require('./OvertimeBalance'),
+  LateArrivalReason: require('./LateArrivalReason'),
   GeofenceDevice: require('./GeofenceDevice'),
   GeofenceEvent: require('./GeofenceEvent'),
   RefreshToken: require('./RefreshToken')

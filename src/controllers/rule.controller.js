@@ -8,13 +8,19 @@ const ALLOWED_FIELDS = new Set([
   'halfDayEnabled', 'halfDayMinutes', 'fullDayMinutes', 'twoHalfDaysEqualOneDay',
   'attendanceUseEnvHours', 'morningStartTime', 'lateAfterTime', 'consecutiveLateThreshold',
   'consecutiveLatePenaltyUnits', 'middayAutoCheckoutTime', 'afternoonStartTime',
-  'dayEndAutoCheckoutTime', 'autoCheckoutEnabled', 'noonAutoCheckoutEnabled', 'webLocationRequired'
+  'dayEndAutoCheckoutTime', 'autoCheckoutEnabled', 'noonAutoCheckoutEnabled', 'webLocationRequired',
+  'lunchClockInBlocked', 'autoLunchReturnEnabled', 'paidLunchEnabled',
+  'shiftEndAutoCheckoutEnabled', 'overtimeAutoCheckoutEnabled',
+  'overtimeSessionLimitMinutes', 'overtimeRequiresFullRegularShift', 'postShiftOvertimeEnabled'
 ]);
 
 function validate(body = {}) {
   for (const field of TIME_FIELDS) {
     if (body[field] !== undefined && !isValidTime(body[field])) return `${field} must be HH:mm`;
   }
+  if (body.overtimeSessionLimitMinutes !== undefined &&
+      (!Number.isInteger(Number(body.overtimeSessionLimitMinutes)) || Number(body.overtimeSessionLimitMinutes) < 1 || Number(body.overtimeSessionLimitMinutes) > 1440))
+    return 'overtimeSessionLimitMinutes must be between 1 and 1440';
   if (body.halfDayMinutes !== undefined && (!Number.isFinite(Number(body.halfDayMinutes)) || Number(body.halfDayMinutes) < 0)) return 'halfDayMinutes must be a non-negative number';
   if (body.fullDayMinutes !== undefined && (!Number.isFinite(Number(body.fullDayMinutes)) || Number(body.fullDayMinutes) < 1)) return 'fullDayMinutes must be at least 1';
   const halfDayMinutes = Number(body.halfDayMinutes ?? 240);

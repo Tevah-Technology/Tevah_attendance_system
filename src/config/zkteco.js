@@ -21,10 +21,11 @@ function createDevice() {
 
 async function withDevice(callback) {
   const device = createDevice();
-  await device.createSocket();
   try {
+    await device.createSocket();
     return await callback(device);
   } finally {
+    // Also attempt cleanup when createSocket itself fails.
     try { await device.disconnect(); } catch (_) {}
   }
 }

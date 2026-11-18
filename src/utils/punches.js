@@ -57,7 +57,8 @@ function buildIntervals(punches) {
         inPunchId: openIn._id || openIn.id || null,
         outPunchId: punch._id || punch.id || null,
         outSource: punch.source || null,
-        autoCheckout: Boolean(punch.isAutoCheckout || punch.source === 'AUTO')
+        autoCheckout: Boolean(punch.isAutoCheckout || punch.source === 'AUTO'),
+        inSource: openIn.source || null
       });
       openIn = null;
     }
@@ -67,11 +68,14 @@ function buildIntervals(punches) {
     intervals.push({
       in: openIn.timestamp,
       out: null,
-      minutes: minutesBetween(openIn.timestamp, new Date()),
+      // An unclosed IN is not evidence of worked time up to the present.
+      // The UI can display elapsed time separately using the open session start.
+      minutes: 0,
       inPunchId: openIn._id || openIn.id || null,
       outPunchId: null,
       outSource: null,
       autoCheckout: false,
+      inSource: openIn.source || null,
       open: true
     });
   }
@@ -79,4 +83,22 @@ function buildIntervals(punches) {
   return intervals;
 }
 
-module.exports = { stateToPunchType, verificationLabel, attendanceStateLabel, buildIntervals };
+// Events are never erased. Flag unexpected sequences for review before transferring OT.
+function analyzePunchSequence(punches) {
+  const unknowns = [...punches].filter(p => p && p.timestamp && p.punchType === 'UNKNOWN');
+  const ordered = [...punches].filter(p => p && p.timestamp && ['IN','OUT'].includes(p.punchType))
+    .sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const anomalies = unknowns.map(p => ({ type: 'UNRESOLVED_DEVICE_PUNCH', timestamp: p.timestamp }));
+  let open = null;
+  for (const p of ordered) {
+    if (p.punchType === 'IN') {
+      if (open) anomalies.push({ type: 'CONSECUTIVE_IN', timestamp: p.timestamp });
+      else open = p;
+    } else if (!open) {
+      anomalies.push({ type: 'UNMATCHED_OUT', timestamp: p.timestamp });
+    } else open = null;
+  }
+  return anomalies;
+}
+
+module.exports = { stateToPunchType, verificationLabel, attendanceStateLabel, buildIntervals, analyzePunchSequence };

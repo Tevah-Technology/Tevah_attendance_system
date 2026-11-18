@@ -31,9 +31,17 @@ const MODULES = [
       ['attendance.edit', 'Edit Attendance'],
       ['attendance.delete', 'Delete Attendance'],
       ['attendance.override', 'Override Attendance'],
-      ['attendance.compensate', 'Compensate Late Arrival'],
+      ['attendance.compensate', 'Legacy Late Compensation Access'],
       ['attendance.sync', 'Synchronize Attendance'],
       ['attendance.export', 'Export Attendance']
+    ]
+  },
+  {
+    key: 'compensation', name: 'Hours Compensation & Approvals', permissions: [
+      ['attendance.compensation.view', 'View Employee Hours & Compensation'],
+      ['attendance.compensation.request', 'Create Hours Compensation Requests'],
+      ['attendance.compensation.approve', 'Approve / Reject Requests & Review Late Reasons'],
+      ['attendance.compensation.revoke', 'Revoke Approved Compensation']
     ]
   },
   {
@@ -195,12 +203,16 @@ const MODULES = [
     ]
   },
   {
+    key: 'my_clock', name: 'My Clock In / Out', permissions: [
+      ['self.attendance.view', 'View My Attendance'],
+      ['self.attendance.checkin', 'Clock In (Own Account)'],
+      ['self.attendance.checkout', 'Clock Out (Own Account)']
+    ]
+  },
+  {
     key: 'self', name: 'Employee Self Service', permissions: [
       ['self.profile.view', 'View Own Profile'],
       ['self.profile.edit', 'Edit Own Profile'],
-      ['self.attendance.view', 'View Own Attendance'],
-      ['self.attendance.checkin', 'Check In From Web'],
-      ['self.attendance.checkout', 'Check Out From Web'],
       ['self.leave.view', 'View Own Leave'],
       ['self.leave.create', 'Create Own Leave']
     ]
@@ -214,6 +226,7 @@ const PERMISSION_CATALOG = MODULES.flatMap(module => module.permissions.map(([ke
   moduleName: module.name,
   sensitive: [
     'employees.delete', 'attendance.delete', 'attendance.override', 'attendance.compensate',
+    'attendance.compensation.approve', 'attendance.compensation.revoke',
     'device.users.delete', 'device.time.edit', 'device.console.access',
     'backup.restore', 'settings.security.edit', 'settings.backup.restore',
     'roles.delete', 'roles.assign', 'admin.users.delete'
@@ -244,6 +257,7 @@ const ROLE_TEMPLATES = {
   HR_MANAGER: [
     'dashboard.view', 'employees.view', 'employees.create', 'employees.edit', 'employees.activate', 'employees.deactivate', 'employees.assignShift',
     'attendance.view', 'attendance.history.view', 'attendance.employee.view', 'attendance.export',
+    'attendance.compensation.view', 'attendance.compensation.request', 'attendance.compensation.approve', 'attendance.compensation.revoke',
     'shifts.view', 'shifts.assign',
     'rules.leavePolicy.view', 'rules.leavePolicy.edit', 'rules.holidays.view', 'rules.holidays.edit',
     'leave.view', 'leave.requests.view', 'leave.requests.create', 'leave.requests.edit', 'leave.approve', 'leave.reject', 'leave.grant', 'leave.calendar.view', 'leave.types.view', 'leave.types.create', 'leave.types.edit', 'leave.balances.view', 'leave.export',
@@ -253,7 +267,7 @@ const ROLE_TEMPLATES = {
   ATTENDANCE_MANAGER: [
     'dashboard.view', 'dashboard.deviceHealth.view',
     'employees.view', 'employees.viewDeviceState',
-    'attendance.view', 'attendance.history.view', 'attendance.live.view', 'attendance.employee.view', 'attendance.edit', 'attendance.override', 'attendance.compensate', 'attendance.sync', 'attendance.export',
+    'attendance.view', 'attendance.history.view', 'attendance.live.view', 'attendance.employee.view', 'attendance.edit', 'attendance.override', 'attendance.compensate', 'attendance.compensation.view', 'attendance.compensation.request', 'attendance.compensation.approve', 'attendance.compensation.revoke', 'attendance.sync', 'attendance.export',
     'device.view', 'device.users.view', 'device.attendance.view', 'device.attendance.sync', 'device.sync', 'device.time.view',
     'shifts.view', 'shifts.assign', 'rules.view', 'rules.overtime.view',
     'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view', 'reports.export',

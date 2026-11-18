@@ -4,6 +4,9 @@ const router = express.Router();
 const device = require('../controllers/device.controller');
 const employee = require('../controllers/employee.controller');
 const attendance = require('../controllers/attendance.controller');
+const compensation = require('../controllers/compensation.controller');
+const compensationDaily = require('../controllers/compensation-daily.controller');
+const lateReason = require('../controllers/late-arrival-reason.controller');
 const report = require('../controllers/report.controller');
 const shift = require('../controllers/shift.controller');
 const shiftAssignment = require('../controllers/shift-assignment.controller');
@@ -48,6 +51,11 @@ router.get('/me/permissions', role.myPermissions);
 router.get('/me/profile', p('self.profile.view'), me.profile);
 router.put('/me/profile', p('self.profile.edit'), me.updateProfile);
 router.get('/me/attendance', p('self.attendance.view'), me.attendance);
+router.get('/me/attendance/daily', p('self.attendance.view'), me.attendanceDaily);
+router.get('/me/compensations', p('self.attendance.view'), compensation.myRequests);
+router.post('/me/compensations', p('self.attendance.view'), compensation.employeeRequest);
+router.get('/me/late-reason/pending', p('self.attendance.view'), lateReason.pending);
+router.post('/me/late-reason', p('self.attendance.view'), lateReason.submit);
 router.get('/me/attendance/status', p('self.attendance.view'), attendance.selfStatus);
 router.get('/me/attendance/config', p('self.attendance.view'), async (req, res) => {
   try {
@@ -136,6 +144,7 @@ router.post('/device/users', p('device.users.create'), device.createUser);
 router.put('/device/users/:uid', p('device.users.edit'), device.updateUser);
 router.delete('/device/users/:uid', p('device.users.delete'), device.deleteUser);
 router.get('/device/time', p('device.time.view'), device.time);
+router.get('/device/clock-comparison', p('device.time.view'), device.clockComparison);
 router.get('/device/attendance', p('device.attendance.view'), device.attendance);
 router.get('/device/attendance/diagnostics', p('device.attendance.view'), device.attendanceDiagnostics);
 router.post('/device/time', p('device.time.edit'), device.setTime);
@@ -163,11 +172,18 @@ router.get('/attendance', p('attendance.view'), attendance.list);
 router.get('/attendance/latest', p('attendance.live.view'), attendance.latest);
 router.get('/attendance/stream', p('attendance.live.view'), attendance.stream);
 router.get('/attendance/employee/:employeeId/day/:date', p('attendance.employee.view'), attendance.employeeDay);
-router.post(
-  '/attendance/employee/:employeeId/day/:date/compensate-late',
-  p('attendance.compensate'),
-  attendance.compensateLate
-);
+// Legacy endpoint now creates a pending request instead of bypassing approval.
+router.post('/attendance/employee/:employeeId/day/:date/compensate-late', p('attendance.compensation.request'), compensation.legacyLateRequest);
+// Static subpaths must precede /compensations/:id.
+router.get('/compensations/daily-roster', p('attendance.compensation.view'), compensationDaily.daily);
+router.get('/late-reasons', p('attendance.compensation.view'), lateReason.list);
+router.post('/late-reasons/:id/review', p('attendance.compensation.approve'), lateReason.review);
+router.get('/compensations', p('attendance.compensation.view'), compensation.list);
+router.get('/compensations/:id', p('attendance.compensation.view'), compensation.getOne);
+router.post('/compensations', p('attendance.compensation.request'), compensation.create);
+router.post('/compensations/:id/approve', p('attendance.compensation.approve'), compensation.approve);
+router.post('/compensations/:id/reject', p('attendance.compensation.approve'), compensation.reject);
+router.post('/compensations/:id/revoke', p('attendance.compensation.revoke'), compensation.revoke);
 router.put('/attendance/:id', p('attendance.edit'), attendance.update);
 
 // ============================================================

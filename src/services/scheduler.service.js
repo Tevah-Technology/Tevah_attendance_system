@@ -1,55 +1,107 @@
-const { syncAttendance, startRealtimeListener, autoCheckoutOpenSessions } = require('./attendance.service');
+const {
+  syncAttendance,
+  startRealtimeListener,
+  autoCheckoutOpenSessions,
+  autoLunchReturn
+} = require('./attendance.service');
 
 let realtimeDevice = null;
+let started = false;
+let stopping = false;
+let syncTimer = null;
+let checkoutTimer = null;
+let syncInProgress = false;
+let checkoutInProgress = false;
+let consecutiveSyncFailures = 0;
+
+const ms = (key, fallback, minimum = 10000) => {
+  const value = Number(process.env[key]);
+  return Number.isFinite(value) && value > 0 ? Math.max(minimum, value) : fallback;
+};
+
+const syncInterval = ms('SYNC_INTERVAL_MS', 300000);
+const retryInterval = ms('ZK_RECONNECT_INTERVAL_MS', 30000);
+const checkoutInterval = ms('AUTO_CHECKOUT_CHECK_INTERVAL_MS', 30000);
+
+async function stopRealtimeListener() {
+  const oldDevice = realtimeDevice;
+  realtimeDevice = null;
+  if (oldDevice) {
+    try { await oldDevice.disconnect(); }
+    catch (error) { console.warn('[F28] Listener disconnect:', error.message); }
+  }
+}
+
+async function runDeviceCycle() {
+  if (stopping || syncInProgress) return;
+  syncInProgress = true;
+  let nextDelay = syncInterval;
+
+  try {
+    // Import buffered punches first, so a VPN outage can be recovered.
+    const result = await syncAttendance();
+    console.log('[F28] Attendance sync:', result);
+    consecutiveSyncFailures = 0;
+
+    if (!realtimeDevice && String(process.env.ZK_REALTIME).toLowerCase() === 'true') {
+      try {
+        realtimeDevice = await startRealtimeListener();
+        if (realtimeDevice) console.log('[F28] Realtime listener connected');
+      } catch (error) {
+        console.error('[F28] Realtime listener setup failed:', error.message);
+        nextDelay = retryInterval;
+      }
+    }
+  } catch (error) {
+    consecutiveSyncFailures += 1;
+    console.error(`[F28] Sync failed (${consecutiveSyncFailures}):`, error?.message || error);
+    nextDelay = retryInterval;
+
+    // A VPN outage can leave the realtime socket stale. After two failed
+    // polling attempts, release it. Next successful sync starts a new listener.
+    if (consecutiveSyncFailures >= 2 && realtimeDevice) {
+      console.warn('[F28] Releasing stale realtime listener after sync failures');
+      await stopRealtimeListener();
+    }
+  } finally {
+    syncInProgress = false;
+    if (!stopping) syncTimer = setTimeout(runDeviceCycle, nextDelay);
+  }
+}
+
+async function runCheckoutCycle() {
+  if (stopping || checkoutInProgress) return;
+  checkoutInProgress = true;
+  try {
+    const result = await autoCheckoutOpenSessions();
+    const lunch = await autoLunchReturn();
+    if (lunch?.inserted) console.log('Automatic lunch return:', lunch);
+    if (result?.checkedOut) console.log('Automatic attendance checkout:', result);
+  } catch (error) {
+    console.error('Automatic attendance checkout failed:', error?.message || error);
+  } finally {
+    checkoutInProgress = false;
+    if (!stopping) checkoutTimer = setTimeout(runCheckoutCycle, checkoutInterval);
+  }
+}
+
+async function shutdown(signal) {
+  if (stopping) return;
+  stopping = true;
+  clearTimeout(syncTimer);
+  clearTimeout(checkoutTimer);
+  console.log(`[F28] ${signal} received, disconnecting realtime listener`);
+  await stopRealtimeListener();
+  process.exit(0);
+}
 
 function startSchedulers() {
-  const interval = Math.max(10000, Number(process.env.SYNC_INTERVAL_MS || 300000));
-  const autoCheckoutInterval = Math.max(10000, Number(process.env.AUTO_CHECKOUT_CHECK_INTERVAL_MS || 30000));
-
-  setTimeout(async () => {
-    try {
-      console.log('Initial attendance sync:', await syncAttendance());
-    } catch (error) {
-      console.error('Initial attendance sync failed:', error.message);
-    }
-    try {
-      realtimeDevice = await startRealtimeListener();
-    } catch (error) {
-      console.error('Realtime listener failed:', error.message);
-    }
-  }, 500);
-
-  setInterval(async () => {
-    try {
-      console.log('Automatic attendance sync:', await syncAttendance());
-    } catch (error) {
-      console.error('Automatic attendance sync failed:', error.message);
-    }
-  }, interval);
-
-  // The Rules document is the source of truth for whether automatic checkout
-  // is enabled and for the 13:00/17:30 boundaries. Keep this lightweight poll
-  // running so a frontend rule change takes effect without restarting Node.
-  setTimeout(async () => {
-    try { await autoCheckoutOpenSessions(); }
-    catch (error) { console.error('Initial automatic checkout failed:', error.message); }
-  }, 1000);
-
-  setInterval(async () => {
-    try {
-      const result = await autoCheckoutOpenSessions();
-      if (result.checkedOut) console.log('Automatic attendance checkout:', result);
-    } catch (error) {
-      console.error('Automatic attendance checkout failed:', error.message);
-    }
-  }, autoCheckoutInterval);
-
-  process.on('SIGINT', async () => {
-    if (realtimeDevice) {
-      try { await realtimeDevice.disconnect(); } catch (_) {}
-    }
-    process.exit(0);
-  });
+  if (started) return;
+  started = true;
+  syncTimer = setTimeout(runDeviceCycle, 500);
+  checkoutTimer = setTimeout(runCheckoutCycle, 1000);
+  process.once('SIGINT', () => { void shutdown('SIGINT'); });
+  process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 }
 
 module.exports = { startSchedulers };
