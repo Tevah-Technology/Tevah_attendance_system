@@ -4,7 +4,7 @@ const {GeofenceDevice,GeofenceEvent} = require('../models');
 const {hasPermission}=require('../services/permission.service');
 const attendance = require('../services/attendance.service');
 const {validateWebLocation}=require('../utils/web-location');
-const {evaluate,distanceMeters}=require('../utils/geofence');
+const {evaluate,zones}=require('../utils/geofence');
 
 const DEVICE_RE=/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
 const EVENT_RE=/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
@@ -28,7 +28,7 @@ async function disable(req,res){
  await GeofenceDevice.updateOne({accountId:req.user._id,deviceId},{$set:{active:false,consent:false,revokedAt:new Date()}});
  return res.json({success:true});
 }
-function settings(r){return {enabled:r.geofenceEnabled===true&&r.autoGeofenceEnabled===true,checkIn:r.autoGeofenceCheckIn!==false,checkOut:r.autoGeofenceCheckOut!==false,latitude:r.geofenceLatitude,longitude:r.geofenceLongitude,radiusMeters:r.geofenceRadiusMeters,maxAccuracyMeters:r.geofenceMaxAccuracyMeters,exitDelaySeconds:r.autoGeofenceExitDelaySeconds||90};}
+function settings(r){return {enabled:r.geofenceEnabled===true&&r.autoGeofenceEnabled===true,checkIn:r.autoGeofenceCheckIn!==false,checkOut:r.autoGeofenceCheckOut!==false,latitude:r.geofenceLatitude,longitude:r.geofenceLongitude,radiusMeters:r.geofenceRadiusMeters,maxAccuracyMeters:r.geofenceMaxAccuracyMeters,exitDelaySeconds:r.autoGeofenceExitDelaySeconds||90,locations:zones(r)};}
 async function status(req,res){
  const rule=await attendance.getRule();const devices=await GeofenceDevice.find({accountId:req.user._id,active:true}).lean();
  res.json({success:true,settings:settings(rule),devices:devices.map(publicDevice)});
@@ -43,10 +43,9 @@ function validateRequest(req){
 function confirmBoundary(rule,location,transition){
  const r=evaluate(rule,location);
  // For EXIT, being outside requires the entire GPS uncertainty circle to be outside.
- const outside=r.accuracyMeters<=rule.geofenceMaxAccuracyMeters &&
-   r.distanceMeters-r.accuracyMeters>rule.geofenceRadiusMeters;
+ const outside=r.outsideAll;
  return {...r,allowed:transition==='ENTER'?r.allowed:outside,
-  reason:transition==='ENTER'?r.reason:(outside?'Outside office geofence':'Outside boundary not confirmed with sufficient accuracy')};
+  reason:transition==='ENTER'?r.reason:(outside?'Outside all office geofences':'Outside boundary not confirmed with sufficient accuracy')};
 }
 async function event(req,res){
  try{

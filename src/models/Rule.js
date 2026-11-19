@@ -43,6 +43,14 @@ const ruleSchema = new mongoose.Schema({
   geofenceLongitude: {type:Number,default:null,min:-180,max:180},
   geofenceRadiusMeters: {type:Number,default:150,min:25,max:5000},
   geofenceMaxAccuracyMeters: {type:Number,default:75,min:5,max:500},
+  // Multi-site zones. Empty array preserves the legacy single-office configuration.
+  geofenceLocations: {type:[new mongoose.Schema({
+    name:{type:String,required:true,trim:true,maxlength:100},
+    latitude:{type:Number,required:true,min:-90,max:90},
+    longitude:{type:Number,required:true,min:-180,max:180},
+    radiusMeters:{type:Number,required:true,min:25,max:5000},
+    enabled:{type:Boolean,default:true}
+  },{_id:false})],default:[]},
   // Native OS-managed geofence events; disabled until a mobile app is installed.
   autoGeofenceEnabled: {type:Boolean,default:false},
   autoGeofenceCheckIn: {type:Boolean,default:true},

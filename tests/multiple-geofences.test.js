@@ -1,0 +1,13 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {zones, evaluate, validateForAttendance} = require('../src/utils/geofence');
+const base={geofenceEnabled:true,geofenceCheckIn:true,geofenceCheckOut:true,geofenceMaxAccuracyMeters:75,geofenceLatitude:8.6,geofenceLongitude:76.9,geofenceRadiusMeters:200,geofenceLocations:[{name:'Main Office',latitude:8.5241,longitude:76.9366,radiusMeters:250,enabled:true},{name:'Branch Office',latitude:8.50,longitude:76.95,radiusMeters:150,enabled:true}]};
+const loc=(latitude,longitude,accuracyMeters=10)=>({latitude,longitude,accuracyMeters,capturedAt:new Date().toISOString()});
+test('authorized branch is permitted',()=>{const r=evaluate(base,loc(8.50,76.95));assert.equal(r.allowed,true);assert.equal(r.locationName,'Branch Office');});
+test('distance outside all locations is confirmed outside',()=>{const r=evaluate(base,loc(8.8,77));assert.equal(r.allowed,false);assert.equal(r.outsideAll,true);});
+test('disabled office is excluded, not treated as authorized',()=>{const r=evaluate({...base,geofenceLocations:base.geofenceLocations.map((z,i)=>({...z,enabled:i===0}))},loc(8.50,76.95));assert.equal(r.allowed,false);});
+test('all locations disabled never silently fall back to legacy coordinates',()=>{const r={...base,geofenceLocations:[{name:'Disabled',latitude:8.6,longitude:76.9,radiusMeters:200,enabled:false}]};assert.deepEqual(zones(r),[]);assert.throws(()=>evaluate(r,loc(8.6,76.9)),/No active/);});
+test('no configured locations preserves legacy office behavior',()=>{const r={...base,geofenceLocations:[]};assert.equal(evaluate(r,loc(8.6,76.9)).allowed,true);});
+test('uncertain GPS cannot verify an exit',()=>{const r=evaluate(base,loc(8.5241,76.9366,100));assert.equal(r.outsideAll,false);assert.equal(r.allowed,false);});
+test('attendance result records matched office name',()=>{const r=validateForAttendance({location:loc(8.5,76.95)},base,'in');assert.equal(r.geofence.locationName,'Branch Office');});
