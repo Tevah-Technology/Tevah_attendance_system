@@ -1,6 +1,6 @@
 const { Leave, LeaveType, Employee } = require('../models');
 const { getLeaveRule, effectiveLeavePolicy } = require('./leave-rule.service');
-const { holidayDateKeys, startOfDay, dateKey } = require('./holiday.service');
+const { holidayDateKeys, startOfDay, dateKey, calendarKey } = require('./holiday.service');
 
 function yearBounds(year) {
   const start = new Date(Number(year), 0, 1);
@@ -60,14 +60,13 @@ function dayDiff(a, b) {
   return Math.floor((two - one) / 86400000);
 }
 
-async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = false } = {}) {
-  if (halfDay) return { days: 0.5, excludedWeekends: 0, excludedHolidays: 0, chargeableDates: [startOfDay(fromDate)] };
+async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = false, employee = null } = {}) {
 
   const from = startOfDay(fromDate);
   const to = startOfDay(toDate);
   const { exact, recurring } = policy.includeHolidaysInLeaveDays
     ? { exact: new Set(), recurring: new Set() }
-    : await holidayDateKeys(from, to);
+    : await holidayDateKeys(from, to, employee);
 
   let excludedWeekends = 0;
   let excludedHolidays = 0;
@@ -75,7 +74,7 @@ async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = fal
   const cursor = new Date(from);
 
   while (cursor <= to) {
-    const exactKey = cursor.toISOString().slice(0, 10);
+    const exactKey = calendarKey(cursor);
     const holiday = exact.has(exactKey) || recurring.has(dateKey(cursor));
     const weekend = isWeekend(cursor);
 
@@ -90,8 +89,11 @@ async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = fal
     cursor.setDate(cursor.getDate() + 1);
   }
 
+  if (halfDay && (calendarKey(from) !== calendarKey(to) || chargeableDates.length !== 1)) {
+    throw errorWith('HALF_DAY_INVALID_DATE', 'Half-day leave must be one eligible working date.', 409);
+  }
   return {
-    days: chargeableDates.length,
+    days: halfDay ? 0.5 : chargeableDates.length,
     excludedWeekends,
     excludedHolidays,
     chargeableDates
@@ -307,6 +309,7 @@ async function validateLeaveRequest({
     Employee.findOne({ employeeId: String(employeeId) }).lean()
   ]);
   if (!employee) throw errorWith('EMPLOYEE_NOT_FOUND', 'Employee not found', 404);
+  if (!leaveType) throw errorWith('LEAVE_TYPE_REQUIRED', 'Select one of the configured leave types.', 400);
 
   const policy = effectiveLeavePolicy(rule, leaveType);
   const from = startOfDay(fromDate);
@@ -317,7 +320,7 @@ async function validateLeaveRequest({
     throw errorWith('HALF_DAY_NOT_ALLOWED', `${leaveType.name} does not allow half-day leave.`, 409);
   }
 
-  if (from < today) {
+  if (from < today && !isAdminGrant) {
     const backdatedDays = dayDiff(from, today);
     if (!rule.allowBackdatedLeave || backdatedDays > Number(rule.maxBackdatedDays || 0)) {
       throw errorWith('BACKDATED_LEAVE_NOT_ALLOWED', `Backdated leave is not allowed beyond ${Number(rule.maxBackdatedDays || 0)} day(s).`, 409);
@@ -343,7 +346,8 @@ async function validateLeaveRequest({
     throw errorWith('NOTICE_PERIOD_LEAVE_RESTRICTED', 'Leave is not allowed during the notice period.', 409);
   }
 
-  const calculated = await calculateChargeableDays(from, to, policy, { halfDay });
+  if (from.getFullYear() !== to.getFullYear()) throw errorWith('CROSS_YEAR_LEAVE', 'Split leave requests at the calendar year boundary.', 409);
+  const calculated = await calculateChargeableDays(from, to, policy, { halfDay, employee });
   if (calculated.days <= 0) {
     throw errorWith('NO_CHARGEABLE_LEAVE_DAYS', 'The selected range contains no chargeable leave days after weekend/holiday exclusions.', 409);
   }

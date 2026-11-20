@@ -29,6 +29,7 @@ const fakeModels = {
 };
 const fakeRequire = (name) => {
   if (name === '../models') return fakeModels;
+  if (name === './holiday.service') return { listActiveHolidays: async () => [], employeeHolidayEligible: () => false, holidayOccursOn: () => false, calendarKey: () => '' };
   if (name === './shift-assignment.service') return {
     createReportShiftResolver: async () => () => ({shift: {
       startTime:'09:00',endTime:'17:00',requiredMinutes:480}})

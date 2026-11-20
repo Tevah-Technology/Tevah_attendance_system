@@ -10,6 +10,10 @@ const holidaySchema = new mongoose.Schema({
     index: true
   },
   description: { type: String, default: '' },
+  // ALL (default, backward compatible), EMPLOYEES, or DEPARTMENTS.
+  appliesTo: { type: String, enum: ['ALL', 'EMPLOYEES', 'DEPARTMENTS'], default: 'ALL' },
+  employeeIds: { type: [String], default: [] },
+  departments: { type: [String], default: [] },
   recurringAnnual: { type: Boolean, default: false },
   active: { type: Boolean, default: true, index: true }
 }, { timestamps: true });

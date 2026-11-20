@@ -1,5 +1,6 @@
 const { AdminUser, Role } = require('../models');
 const { ALL_PERMISSIONS, rolePermissions } = require('../config/permissions');
+const { ownAccountPermissions } = require('./self-workspace-permissions');
 
 async function getRoleForUser(user) {
   if (!user) return null;
@@ -19,7 +20,9 @@ async function getEffectiveAccess(user) {
   return {
     role,
     roleCode,
-    permissions: [...new Set(permissions)],
+    // Any account linked to its own employee profile can use personal self-service.
+    // Never grant management permissions here, and never infer a link from email.
+    permissions: [...new Set([...permissions, ...ownAccountPermissions(user)])],
     dataScope: role?.dataScope || { type: roleCode === 'SUPER_ADMIN' ? 'ALL' : 'ALL', departments: [], employeeIds: [] },
     approvalScope: role?.approvalScope || { type: roleCode === 'SUPER_ADMIN' ? 'ALL' : 'ALL', departments: [], employeeIds: [] }
   };

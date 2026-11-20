@@ -1,4 +1,5 @@
 const { Leave, Employee } = require('../models');
+const { listActiveHolidays, employeeHolidayEligible, holidayOccursOn, calendarKey } = require('../services/holiday.service');
 const { notifyEmployee } = require('../services/notification.service');
 const { restrictEmployeeFilter, assertEmployeeAllowed } = require('../services/access-scope.service');
 const {
@@ -280,6 +281,12 @@ async function calendar(req, res) {
   try {
     const from = new Date(req.query.from || new Date(new Date().getFullYear(), new Date().getMonth(), 1));
     const to = new Date(req.query.to || new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0));
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || to < from || to - from > 366 * 86400000) {
+      return res.status(400).json({ success: false, message: 'Select a valid calendar range of at most 366 days' });
+    }
+    if (req.query.employeeId && !(await assertEmployeeAllowed(req, req.query.employeeId))) {
+      return res.status(403).json({ success: false, message: 'Employee outside your data scope' });
+    }
     const filter = { status: 'APPROVED', $or: [
       { fromDate: { $lte: to }, toDate: { $gte: from } },
       { fromDate: null, date: { $gte: from, $lte: to } }
@@ -287,7 +294,17 @@ async function calendar(req, res) {
     if (req.query.employeeId) filter.employeeId = req.query.employeeId;
     const scopedFilter = await restrictEmployeeFilter(req, filter);
     const leaves = await Leave.find(scopedFilter).sort({ fromDate: 1, date: 1 }).lean();
-    res.json({ success: true, from, to, leaves });
+    const employee = req.query.employeeId ? await Employee.findOne({ employeeId: String(req.query.employeeId) }).lean() : null;
+    const holidays = await listActiveHolidays(from, to, employee);
+    const occurrences = [];
+    for (const h of holidays) {
+      for (let d = new Date(from.getFullYear(), from.getMonth(), from.getDate()); d <= to; d.setDate(d.getDate() + 1)) {
+        if (holidayOccursOn(h, d) && (!employee || employeeHolidayEligible(h, employee))) {
+          occurrences.push({ holidayId: h._id, date: calendarKey(d), name: h.name, type: h.type, appliesTo: h.appliesTo || 'ALL' });
+        }
+      }
+    }
+    res.json({ success: true, from, to, leaves, holidays: occurrences });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
   }
