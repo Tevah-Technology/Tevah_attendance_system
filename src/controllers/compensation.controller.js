@@ -37,8 +37,10 @@ function normalizeBody(body) {
   const reason = String(body?.reason || '').trim();
   const creditMode = String(body?.creditMode || 'MERGE').trim().toUpperCase();
   if (!['MERGE', 'SEPARATE'].includes(creditMode)) throw new Error('creditMode must be MERGE or SEPARATE');
-  if (type === 'LATE_ARRIVAL' && creditMode !== 'MERGE') throw new Error('Late arrival allowance cannot use SEPARATE mode');
-  if (type === 'EXTRA_HOURS_TRANSFER' && creditMode !== 'MERGE') throw new Error('Overtime transfers must count toward hours; use MISSING_HOURS for a separate administrative note');
+  // MERGE counts approved minutes toward the remaining required-hour shortage.
+  // SEPARATE is an audited adjustment only, never physical or credited work.
+  // For newly created late MERGE requests, the explicit flag below prevents
+  // historical late-only MERGE approvals from being retroactively credited.
   if (!TYPES.has(type)) throw new Error('Invalid compensation type');
   if (!employeeId || employeeId.length > 100) throw new Error('Valid employeeId is required');
   if (!localDate(date) || date > today()) throw new Error('date must be a valid non-future YYYY-MM-DD date');
@@ -47,7 +49,16 @@ function normalizeBody(body) {
   if (type === 'EXTRA_HOURS_TRANSFER') {
     if (!localDate(sourceDate) || sourceDate > today() || sourceDate === date) throw new Error('A valid different, non-future sourceDate is required');
   } else if (sourceDate) throw new Error('sourceDate applies only to EXTRA_HOURS_TRANSFER');
-  return { type, employeeId, date, minutes, sourceDate, reason, creditMode, creditBucket: type === 'LATE_ARRIVAL' || creditMode === 'SEPARATE' ? null : 'HOURS', lateBucket: type === 'LATE_ARRIVAL' ? 'LATE' : null };
+  const countsHours = creditMode === 'MERGE' &&
+    (type !== 'LATE_ARRIVAL' || body?.legacyLateOnly !== true);
+  return { type, employeeId, date, minutes, sourceDate, reason, creditMode,
+    creditBucket: countsHours ? 'HOURS' : null,
+    lateBucket: type === 'LATE_ARRIVAL' ? 'LATE' : null,
+    separateBucket: creditMode === 'SEPARATE' ? type : null,
+    // Only NEW explicit late MERGE approvals credit missing hours. Historical
+    // late-only approvals and employee late requests remain late-only.
+    countTowardsMissingHours: countsHours && type === 'LATE_ARRIVAL'
+  };
 }
 async function visible(req, employeeId, approval = false) {
   return assertEmployeeAllowed({ ...req, access: { ...req.access, dataScope: approval ? req.access.approvalScope : req.access.dataScope } }, employeeId);
@@ -61,10 +72,15 @@ async function validateCredit(record) {
   if (!target) throw new Error('Employee attendance report unavailable');
   if (record.type === 'LATE_ARRIVAL') {
     if (!target.firstIn) throw new Error('Late-arrival compensation requires an original IN punch');
-    // Legacy allowances are still represented in the report. Do not duplicate them.
-    if (record.minutes > Math.max(0, Number(target.rawLateMinutes) - Number(target.lateCompensationMinutes))) {
+    const remainingLate = Math.max(0, Number(target.rawLateMinutes) - Number(target.lateCompensationMinutes));
+    if (record.minutes > remainingLate) {
       throw new Error('Requested late allowance exceeds the remaining uncompensated late minutes');
     }
+    if (record.creditMode === 'MERGE' && record.countTowardsMissingHours === true) {
+      const shortage = Math.max(0, Number(target.requiredMinutes || 0) - Number(target.effectiveWorkedMinutes || 0));
+      if (record.minutes > shortage) throw new Error(`Late hour credit exceeds the remaining missing hours (${shortage} minutes)`);
+    }
+    // SEPARATE does not alter late penalties or attendance totals.
     return;
   }
   if (target.status === 'LEAVE' || target.status === 'OFF') {
@@ -163,21 +179,48 @@ async function logDecision(req, action, record) {
         minutes: record.minutes, status: record.status, creditMode: record.creditMode, origin: record.origin } });
   } catch (err) { console.error('Compensation audit mirror unavailable:', err.message); }
 }
+// Prevent a second pending or approved credit for the same employee, target
+// date and credit category. Rejected/revoked records do not block eligibility.
+// A unique PENDING index handles simultaneous submissions; the existing
+// APPROVED indexes handle concurrent administrator approvals.
+function creditConflictFilters(value) {
+  const base = { employeeId: value.employeeId, date: value.date,
+    status: { $in: ['PENDING', 'APPROVED'] } };
+  const filters = [];
+  if (value.lateBucket === 'LATE') filters.push({ ...base, lateBucket: 'LATE' });
+  if (value.creditBucket === 'HOURS') filters.push({ ...base, creditBucket: 'HOURS' });
+  if (value.separateBucket) {
+    // Also catch older SEPARATE records created before separateBucket existed.
+    filters.push({ ...base, type: value.type, creditMode: 'SEPARATE' });
+  }
+  return filters;
+}
+async function assertNoExistingCredit(value) {
+  for (const filter of creditConflictFilters(value)) {
+    const existing = await Compensation.findOne(filter).select('_id status').lean();
+    if (existing) throw new Error(`A ${existing.status.toLowerCase()} compensation for this category already exists on this date. ` +
+      (existing.status === 'APPROVED' ? 'Revoke it first.' : 'Decide or reject the pending request first.'));
+  }
+}
+function isDuplicateKey(error) { return error?.code === 11000; }
 async function create(req, res) {
   try {
     if (!can(req, 'attendance.compensation.request')) return failure(res, 403, 'Missing compensation request permission');
     const value = normalizeBody(req.body);
     if (!(await visible(req, value.employeeId))) return failure(res, 403, 'Employee outside your scope');
     if (!(await Employee.exists({ employeeId: value.employeeId }))) return failure(res, 404, 'Employee not found');
+    await assertNoExistingCredit(value);
     const item = await Compensation.create({ ...value, origin: 'ADMIN', requestedBy: req.user._id,
       history: [{ action: 'REQUESTED', actorId: req.user._id, actorEmail: req.user.email, reason: value.reason }] });
     await logDecision(req, 'REQUESTED', item);
     return res.status(201).json({ success: true, compensation: item });
-  } catch (e) { return failure(res, 400, e.message); }
+  } catch (e) { return failure(res, isDuplicateKey(e) ? 409 : /already exists/.test(e.message) ? 409 : 400,
+    isDuplicateKey(e) ? 'A pending compensation already exists for this employee and date' : e.message); }
 }
 async function legacyLateRequest(req, res) {
   req.body = { employeeId: req.params.employeeId, date: req.params.date,
-    type: 'LATE_ARRIVAL', minutes: req.body?.minutes, reason: req.body?.reason };
+    type: 'LATE_ARRIVAL', minutes: req.body?.minutes, reason: req.body?.reason,
+    creditMode: 'MERGE', legacyLateOnly: true };
   return create(req, res);
 }
 async function list(req, res) {
@@ -231,6 +274,12 @@ async function decide(req, res, action) {
       return failure(res, 400, 'A decision reason of 1–1000 characters is required');
     }
     if (action === 'APPROVED') {
+      for (const conflicting of creditConflictFilters(item)) {
+        const otherApproved = await Compensation.exists({ ...conflicting,
+          status: 'APPROVED', _id: { $ne: item._id } });
+        if (otherApproved) return failure(res, 409,
+          'An approved compensation already covers this category and date. Revoke it first.');
+      }
       await validateCredit(item);
       if (item.type === 'EXTRA_HOURS_TRANSFER') {
         const source = await day(item.employeeId, item.sourceDate);
@@ -280,18 +329,24 @@ async function employeeRequest(req, res) {
   try {
     const employeeId = String(req.user?.employeeId || '').trim();
     if (!employeeId) return failure(res, 403, 'Employee profile is not linked');
-    const value = normalizeBody({ ...req.body, employeeId });
+    // Employees do not choose the admin-only hours-credit policy. Employee
+    // late requests continue as late-only allowances until admin selects
+    // an explicit hours-credit request on the admin side.
+    const value = normalizeBody({ ...req.body, employeeId,
+      legacyLateOnly: String(req.body?.type || '').toUpperCase() === 'LATE_ARRIVAL' });
     if (value.creditMode !== 'MERGE') return failure(res, 403, 'Only administrators can create separate-mode adjustments');
     if (!(await Employee.exists({ employeeId }))) return failure(res, 404, 'Employee not found');
     if (value.date >= today()) return failure(res, 400, 'Select a completed past attendance day');
     if (value.type === 'EXTRA_HOURS_TRANSFER' && value.sourceDate >= today()) return failure(res, 400, 'Overtime source must be a completed past day');
     // Eligibility is revalidated at approval; no hours are credited on submission.
+    await assertNoExistingCredit(value);
     const item = await Compensation.create({ ...value, origin: 'EMPLOYEE', requestedBy: req.user._id,
       history: [{ action: 'REQUESTED', actorId: req.user._id, actorEmail: req.user.email || '', reason: value.reason }] });
     await logDecision(req, 'REQUESTED', item);
     return res.status(201).json({ success: true, compensation: { id: item._id, employeeId, date: item.date,
       sourceDate: item.sourceDate, type: item.type, creditMode: item.creditMode, minutes: item.minutes, status: item.status } });
-  } catch (e) { return failure(res, 400, e.message); }
+  } catch (e) { return failure(res, isDuplicateKey(e) ? 409 : /already exists/.test(e.message) ? 409 : 400,
+    isDuplicateKey(e) ? 'A pending compensation already exists for this employee and date' : e.message); }
 }
 module.exports = {
   create, legacyLateRequest, list, getOne, myRequests, employeeRequest,
