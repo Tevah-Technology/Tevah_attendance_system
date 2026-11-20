@@ -11,6 +11,7 @@ const reportPath = path.join(__dirname, '../src/services/report.service.js');
 const reportCode = fs.readFileSync(reportPath, 'utf8');
 const fakeRequire = (name) => {
   if (name === '../models') return {};
+  if (name === './holiday.service') return { listActiveHolidays: async () => [], employeeHolidayEligible: () => false, holidayOccursOn: () => false, calendarKey: () => '' };
   if (name === './shift-assignment.service') return { createReportShiftResolver() {} };
   if (name.startsWith('../')) return require(path.resolve(path.dirname(reportPath), name));
   return require(name);

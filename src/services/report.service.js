@@ -18,6 +18,7 @@ const {
 } = require('../utils/attendance-policy');
 
 const { createReportShiftResolver } = require('./shift-assignment.service');
+const { listActiveHolidays, employeeHolidayEligible, holidayOccursOn, calendarKey } = require('./holiday.service');
 
 const {
   startOfDay,
@@ -70,7 +71,8 @@ function makeDaySummary(
   leave,
   attendanceRule = {},
   shiftContext = {},
-  approvedCompensations = []
+  approvedCompensations = [],
+  holiday = null
 ) {
   const sorted = [...punches]
     .filter((punch) => punch && punch.timestamp)
@@ -345,6 +347,8 @@ function makeDaySummary(
     status = 'LEAVE';
   } else if (sorted.length > 0 || creditedMinutes > 0) {
     status = 'PRESENT';
+  } else if (holiday) {
+    status = 'HOLIDAY';
   } else if (workingDay) {
     status = 'ABSENT';
   } else {
@@ -395,6 +399,8 @@ function makeDaySummary(
       employee.designation || '',
 
     status,
+    holiday: holiday ? { id: holiday._id, name: holiday.name, type: holiday.type } : null,
+    leave: leave ? { id: leave._id, type: leave.type, halfDay: Boolean(leave.halfDay) } : null,
 
     // Authoritative self-attendance state for Daily Attendance Console.
     clockState,
@@ -720,11 +726,10 @@ async function buildReport({
         employeeId:
           employee.employeeId,
 
-        date: {
-          $gte: queryStartDate,
-          $lt: endDate
-        },
-
+        $or: [
+          { fromDate: { $lt: endDate }, toDate: { $gte: queryStartDate } },
+          { fromDate: null, date: { $gte: queryStartDate, $lt: endDate } }
+        ],
         approved: true
       })
       .lean();
@@ -769,15 +774,22 @@ async function buildReport({
     const leaveByDay =
       new Map();
 
+    const employeeHolidays = (await listActiveHolidays(queryStartDate, toDate, employee));
+    const holidayByDay = new Map();
+    for (const d of iterateDays(queryStartDate, toDate)) {
+      const applicable = employeeHolidays.find(h => employeeHolidayEligible(h, employee) && holidayOccursOn(h, d));
+      if (applicable) holidayByDay.set(dateKey(d), applicable);
+    }
     for (const leave of leaves) {
-      if (!leave.date) {
-        continue;
+      if (!leave.date) continue;
+      const first = startOfDay(leave.fromDate || leave.date);
+      const last = startOfDay(leave.toDate || leave.date);
+      for (const d of iterateDays(first, last)) {
+        // Leave does not override employee holidays or non-chargeable weekends.
+        if (holidayByDay.has(dateKey(d)) && leave.policySnapshot?.includeHolidaysInLeaveDays !== true) continue;
+        if ([0, 6].includes(d.getDay()) && leave.policySnapshot?.includeWeekendsInLeaveDays !== true) continue;
+        leaveByDay.set(dateKey(d), leave);
       }
-
-      leaveByDay.set(
-        dateKey(leave.date),
-        leave
-      );
     }
 
     // --------------------------------------------------------
@@ -830,7 +842,8 @@ async function buildReport({
         leave,
         attendanceRule,
         shiftContext,
-        creditsByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || []
+        creditsByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || [],
+        holidayByDay.get(key) || null
       );
       row.transferredOutMinutes = transferOutByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || 0;
       row.availableOvertimeMinutes = Math.max(0, row.overtimeMinutes - row.transferredOutMinutes);
@@ -848,7 +861,7 @@ async function buildReport({
           row.fullDay = false;
           lateStreak = 0;
         }
-      } else if (row.status !== 'OFF') {
+      } else if (!['OFF', 'HOLIDAY'].includes(row.status)) {
         lateStreak = 0;
       }
 
@@ -877,7 +890,7 @@ function aggregate(rows) {
   const workingRows =
     safeRows.filter(
       (row) =>
-        row.status !== 'OFF'
+        row.status !== 'OFF' && row.status !== 'HOLIDAY'
     );
 
   const presentRows =
