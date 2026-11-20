@@ -90,13 +90,16 @@ function makeDaySummary(
   );
 
   // Actual biometric work remains distinct from administratively credited time.
-  const creditedMinutes = approvedCompensations.filter(c => c.type !== 'LATE_ARRIVAL' && c.creditMode !== 'SEPARATE')
+  const creditedMinutes = approvedCompensations.filter(c => c.creditMode !== 'SEPARATE' &&
+    (c.type !== 'LATE_ARRIVAL' || c.countTowardsMissingHours === true))
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
   const missingHoursCompensationMinutes = approvedCompensations.filter(c => c.type === 'MISSING_HOURS' && c.creditMode !== 'SEPARATE')
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
-  const transferredInMinutes = approvedCompensations.filter(c => c.type === 'EXTRA_HOURS_TRANSFER')
+  const transferredInMinutes = approvedCompensations.filter(c =>
+    c.type === 'EXTRA_HOURS_TRANSFER' && c.creditMode !== 'SEPARATE')
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
-  const approvedLateMinutes = approvedCompensations.filter(c => c.type === 'LATE_ARRIVAL')
+  const approvedLateMinutes = approvedCompensations.filter(c =>
+    c.type === 'LATE_ARRIVAL' && c.creditMode !== 'SEPARATE')
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
   const separateAdjustmentMinutes = approvedCompensations.filter(c => c.creditMode === 'SEPARATE')
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
@@ -441,7 +444,9 @@ function makeDaySummary(
     transferredInMinutes,
     transferredOutMinutes: 0, // filled by report-builder from approved source-day transfers
     availableOvertimeMinutes: overtimeMinutes, // admin approval of transfer verifies auto-closed sessions
-    approvedCompensations: approvedCompensations.map(c => ({ id: c._id, type: c.type, creditMode: c.creditMode || 'MERGE', minutes: c.minutes, sourceDate: c.sourceDate })),
+    approvedCompensations: approvedCompensations.map(c => ({ id: c._id, type: c.type,
+      creditMode: c.creditMode || 'MERGE', countTowardsMissingHours: c.countTowardsMissingHours === true,
+      minutes: c.minutes, sourceDate: c.sourceDate })),
 
     breakMinutes,
 
@@ -450,7 +455,7 @@ function makeDaySummary(
     lateCompensationMinutes,
 
     lateCompensationReason:
-      [firstInPunch?.lateCompensationReason, ...approvedCompensations.filter(c => c.type === 'LATE_ARRIVAL').map(c => c.reason)].filter(Boolean).join(' | '),
+      [firstInPunch?.lateCompensationReason, ...approvedCompensations.filter(c => c.type === 'LATE_ARRIVAL' && c.creditMode !== 'SEPARATE').map(c => c.reason)].filter(Boolean).join(' | '),
 
     lateCompensatedAt:
       firstInPunch?.lateCompensatedAt || null,
@@ -592,6 +597,16 @@ function reportDiagnosticLog(id, message) {
   if (reportDiagnosticsEnabled()) console.log(`[REPORT ${id}] ${message}`);
 }
 
+// Compensation.date and Compensation.sourceDate are stored as local
+// YYYY-MM-DD strings. The general-purpose dateKey() returns an ISO timestamp
+// and MUST NOT be used to compare or join these string fields.
+function compensationDateKey(value) {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const d = startOfDay(value);
+  return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0')].join('-');
+}
+
 // ============================================================
 // BUILD REPORT
 // ============================================================
@@ -666,17 +681,17 @@ async function buildReport({
   const compensationEmployeeIds = employees.map(e => e.employeeId);
   const approved = compensationEmployeeIds.length ? await Compensation.find({
     employeeId: { $in: compensationEmployeeIds }, status: 'APPROVED',
-    $or: [ { date: { $gte: dateKey(queryStartDate), $lte: dateKey(toDate) } },
-           { type: 'EXTRA_HOURS_TRANSFER', sourceDate: { $gte: dateKey(queryStartDate), $lte: dateKey(toDate) } } ]
+    $or: [ { date: { $gte: compensationDateKey(queryStartDate), $lte: compensationDateKey(toDate) } },
+           { type: 'EXTRA_HOURS_TRANSFER', sourceDate: { $gte: compensationDateKey(queryStartDate), $lte: compensationDateKey(toDate) } } ]
   }).lean() : [];
   const creditsByDay = new Map();
   const transferOutByDay = new Map();
   for (const c of approved) {
-    const key = `${c.employeeId}|${c.date}`;
+    const key = `${c.employeeId}|${compensationDateKey(c.date)}`;
     if (!creditsByDay.has(key)) creditsByDay.set(key, []);
     creditsByDay.get(key).push(c);
     if (c.type === 'EXTRA_HOURS_TRANSFER') {
-      const sourceKey = `${c.employeeId}|${c.sourceDate}`;
+      const sourceKey = `${c.employeeId}|${compensationDateKey(c.sourceDate)}`;
       transferOutByDay.set(sourceKey, (transferOutByDay.get(sourceKey) || 0) + c.minutes);
     }
   }
@@ -815,9 +830,9 @@ async function buildReport({
         leave,
         attendanceRule,
         shiftContext,
-        creditsByDay.get(`${employee.employeeId}|${key}`) || []
+        creditsByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || []
       );
-      row.transferredOutMinutes = transferOutByDay.get(`${employee.employeeId}|${key}`) || 0;
+      row.transferredOutMinutes = transferOutByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || 0;
       row.availableOvertimeMinutes = Math.max(0, row.overtimeMinutes - row.transferredOutMinutes);
 
       // OFF days (for example Sunday) do not break a late-arrival streak.
@@ -1008,6 +1023,7 @@ function aggregate(rows) {
 
 module.exports = {
   buildReport,
+  compensationDateKey,
   aggregate,
   makeDaySummary,
   getEmployeeShift,
