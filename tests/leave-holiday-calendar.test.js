@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 process.env.TZ = 'Asia/Kolkata';
-const { Holiday } = require('../src/models');
+const { Holiday, EmployeeException } = require('../src/models');
 const { employeeHolidayEligible, holidayOccursOn, calendarKey } = require('../src/services/holiday.service');
 const { calculateChargeableDays } = require('../src/services/leave.service');
 const { makeDaySummary } = require('../src/services/report.service');
@@ -14,8 +14,10 @@ const holiday = {
 };
 function withHolidayQuery(items, callback) {
   const old = Holiday.find;
+  const oldExceptionFind = EmployeeException.find;
+  EmployeeException.find = () => ({lean:async()=>[]});
   Holiday.find = () => ({ sort: () => ({ lean: async () => items }) });
-  return Promise.resolve().then(callback).finally(() => { Holiday.find = old; });
+  return Promise.resolve().then(callback).finally(() => { Holiday.find = old; EmployeeException.find=oldExceptionFind; });
 }
 test('employee-assigned holiday applies to selected employee only', () => {
   assert.equal(employeeHolidayEligible(holiday, {employeeId:'EMP007'}), true);

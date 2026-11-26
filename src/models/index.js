@@ -1,5 +1,8 @@
 module.exports = {
+  EmployeeException: require('./EmployeeException'),
   Attendance: require('./Attendance'),
+  AttendanceAdjustment: require('./AttendanceAdjustment'),
+  EmployeeNotification: require('./EmployeeNotification'),
   EmployeePunchLock: require('./EmployeePunchLock'),
   RejectedPunch: require('./RejectedPunch'),
   Employee: require('./Employee'),
@@ -7,6 +10,7 @@ module.exports = {
   LeaveType: require('./LeaveType'),
   LeaveRule: require('./LeaveRule'),
   Holiday: require('./Holiday'),
+  AttendanceRuleProfile: require('./AttendanceRuleProfile'),
   Rule: require('./Rule'),
   Settings: require('./Settings'),
   Shift: require('./Shift'),

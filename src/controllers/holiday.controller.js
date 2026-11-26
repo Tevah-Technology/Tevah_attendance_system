@@ -1,5 +1,5 @@
 const { Holiday, Employee } = require('../models');
-const { calendarKey, employeeHolidayEligible, holidayOccursOn } = require('../services/holiday.service');
+const { calendarKey, employeeHolidayEligible, holidayOccursOn, listActiveHolidays } = require('../services/holiday.service');
 const { assertEmployeeAllowed } = require('../services/access-scope.service');
 
 function normalizeDate(value) {
@@ -46,7 +46,8 @@ async function list(req, res) {
       if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
     }
     let holidays = await Holiday.find(filter).sort({ date: 1, name: 1 }).lean();
-    if (employee) holidays = holidays.filter(h => employeeHolidayEligible(h, employee));
+    if (employee && year !== null && req.query.active !== "false") holidays = await listActiveHolidays(new Date(year,0,1), new Date(year,11,31),employee);
+    else if (employee) holidays = holidays.filter(h => employeeHolidayEligible(h, employee));
     // recurringDate provides a concrete occurrence for calendar clients.
     const occurrences = year === null ? null : holidays.flatMap(h => {
       if (!h.recurringAnnual) return [{ ...h, occurrenceDate: calendarKey(h.date) }];

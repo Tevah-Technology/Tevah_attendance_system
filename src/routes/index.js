@@ -1,16 +1,22 @@
+const calendarProfile = require('../controllers/holiday-calendar-profile.controller');
+const employeeLeavePolicy = require('../controllers/employee-leave-policy.controller');
+const leaveAllowance = require('../controllers/employee-leave-allowance.controller');
 const express = require('express');
 const router = express.Router();
 
 const device = require('../controllers/device.controller');
 const employee = require('../controllers/employee.controller');
 const attendance = require('../controllers/attendance.controller');
+const attendanceAdjustment = require('../controllers/attendance-adjustment.controller');
 const compensation = require('../controllers/compensation.controller');
 const compensationDaily = require('../controllers/compensation-daily.controller');
 const lateReason = require('../controllers/late-arrival-reason.controller');
 const report = require('../controllers/report.controller');
+const exceptions = require('../controllers/employee-exception.controller');
 const shift = require('../controllers/shift.controller');
 const shiftAssignment = require('../controllers/shift-assignment.controller');
 const rule = require('../controllers/rule.controller');
+const profile = require('../controllers/attendance-profile.controller');
 const leave = require('../controllers/leave.controller');
 const leaveType = require('../controllers/leave-type.controller');
 const leaveRule = require('../controllers/leave-rule.controller');
@@ -30,7 +36,10 @@ const role = require('../controllers/role.controller');
 const { authenticate, requirePermission, requireAnyPermission } = require('../middleware/auth');
 const { setBroadcaster } = require('../services/attendance.service');
 
+const { requireAttendanceDate, isToday } = require('../utils/attendance-access');
 const p = requirePermission;
+const dateQuery = requireAttendanceDate(req => [req.query.date ?? new Date()]);
+const dateParam = requireAttendanceDate(req => [req.params.date]);
 
 // ============================================================
 // AUTH
@@ -50,6 +59,8 @@ router.get('/me/permissions', role.myPermissions);
 // ============================================================
 router.get('/me/profile', p('self.profile.view'), me.profile);
 router.put('/me/profile', p('self.profile.edit'), me.updateProfile);
+router.get('/me/notifications', p('self.attendance.view'), attendanceAdjustment.mine);
+router.patch('/me/notifications/:id/read', p('self.attendance.view'), attendanceAdjustment.readMine);
 router.get('/me/attendance', p('self.attendance.view'), me.attendance);
 router.get('/me/attendance/daily', p('self.attendance.view'), me.attendanceDaily);
 router.get('/me/compensations', p('self.attendance.view'), compensation.myRequests);
@@ -96,7 +107,7 @@ router.delete('/roles/:id/users/:userId', p('roles.assign'), role.unassignUser);
 // ============================================================
 // DASHBOARD / SYSTEM
 // ============================================================
-router.get('/dashboard/summary', p('dashboard.view'), dashboard.summary);
+router.get('/dashboard/summary', p('dashboard.view'), dateQuery, dashboard.summary);
 router.post('/dashboard/sync', p('dashboard.sync'), dashboard.sync);
 router.get('/system/info', p('system.view'), system.info);
 
@@ -171,7 +182,7 @@ router.post('/employees/:id/sync-to-device', p('employees.sync'), employee.syncT
 router.get('/attendance', p('attendance.view'), attendance.list);
 router.get('/attendance/latest', p('attendance.live.view'), attendance.latest);
 router.get('/attendance/stream', p('attendance.live.view'), attendance.stream);
-router.get('/attendance/employee/:employeeId/day/:date', p('attendance.employee.view'), attendance.employeeDay);
+router.get('/attendance/employee/:employeeId/day/:date', p('attendance.employee.view'), dateParam, attendance.employeeDay);
 // Legacy endpoint now creates a pending request instead of bypassing approval.
 router.post('/attendance/employee/:employeeId/day/:date/compensate-late', p('attendance.compensation.request'), compensation.legacyLateRequest);
 // Static subpaths must precede /compensations/:id.
@@ -184,11 +195,19 @@ router.post('/compensations', p('attendance.compensation.request'), compensation
 router.post('/compensations/:id/approve', p('attendance.compensation.approve'), compensation.approve);
 router.post('/compensations/:id/reject', p('attendance.compensation.approve'), compensation.reject);
 router.post('/compensations/:id/revoke', p('attendance.compensation.revoke'), compensation.revoke);
-router.put('/attendance/:id', p('attendance.edit'), attendance.update);
+router.get('/attendance-adjustments', p('attendance.view'), attendanceAdjustment.list);
+router.post('/attendance-adjustments', p('attendance.deduct_hours'), attendanceAdjustment.create);
+router.post('/attendance-adjustments/:id/revoke', p('attendance.deduct_hours'), attendanceAdjustment.revoke);
+router.put('/attendance/:id', p('attendance.correct_punch'), attendance.update);
 
 // ============================================================
 // SHIFTS
 // ============================================================
+router.get('/employee-exceptions', p('shifts.exceptions.view'), exceptions.list);
+router.post('/employee-exceptions/bulk', p('shifts.exceptions.create'), exceptions.bulkCreate);
+router.post('/employee-exceptions', p('shifts.exceptions.create'), exceptions.create);
+router.put('/employee-exceptions/:id', p('shifts.exceptions.edit'), exceptions.update);
+router.delete('/employee-exceptions/:id', p('shifts.exceptions.delete'), exceptions.remove);
 router.get('/shifts', p('shifts.view'), shift.list);
 router.post('/shifts', p('shifts.create'), shift.create);
 router.put('/shifts/:id', p('shifts.edit'), shift.update);
@@ -202,6 +221,11 @@ router.delete('/shift-assignments/:id', requireAnyPermission('shifts.assignments
 // ============================================================
 // RULES
 // ============================================================
+router.get('/attendance-rule-profiles', p('attendance.rule_profiles.view'), profile.list);
+router.post('/attendance-rule-profiles', p('attendance.rule_profiles.create'), profile.create);
+router.put('/attendance-rule-profiles/:id', p('attendance.rule_profiles.edit'), profile.update);
+router.delete('/attendance-rule-profiles/:id', p('attendance.rule_profiles.delete'), profile.remove);
+router.put('/employees/:id/attendance-configuration', requireAnyPermission('attendance.rule_profiles.assign','employees.timezone.edit','attendance.rules.override'), profile.assign);
 router.get('/rules', p('rules.view'), rule.get);
 router.put('/rules', p('rules.edit'), rule.update);
 router.post('/rules', p('rules.edit'), rule.update);
@@ -211,7 +235,10 @@ router.post('/rules', p('rules.edit'), rule.update);
 // ============================================================
 router.get('/leaves', p('leave.requests.view'), leave.list);
 router.get('/leaves/calendar', p('leave.calendar.view'), leave.calendar);
+router.get('/employee-leave-allowances', p('leave.balances.view'), leaveAllowance.list);
+router.put('/employee-leave-allowances', p('leave.balances.edit'), leaveAllowance.save);
 router.get('/leaves/balances', p('leave.balances.view'), leave.balances);
+router.post('/leaves/recurring', p('leave.grant'), leave.recurring);
 router.post('/leaves', requireAnyPermission('self.leave.create', 'leave.requests.create', 'leave.grant'), async (req, res) => {
   if (req.access.permissions.includes('self.leave.create') && !req.access.permissions.includes('leave.requests.create') && !req.access.permissions.includes('leave.grant')) {
     if (!req.user.employeeId) return res.status(400).json({ success: false, message: 'No employee profile is linked to this account' });
@@ -233,9 +260,17 @@ router.post('/leave-types', p('leave.types.create'), leaveType.create);
 router.put('/leave-types/:id', p('leave.types.edit'), leaveType.update);
 router.delete('/leave-types/:id', p('leave.types.delete'), leaveType.remove);
 
+router.get('/leave-policy-profiles', p('rules.leavePolicy.view'), employeeLeavePolicy.list);
+router.post('/leave-policy-profiles', p('rules.leavePolicy.edit'), employeeLeavePolicy.create);
+router.get('/employee-leave-policies', p('rules.leavePolicy.view'), employeeLeavePolicy.assignments);
+router.put('/employee-leave-policies', p('rules.leavePolicy.edit'), employeeLeavePolicy.assign);
 router.get('/leave-rules', p('rules.leavePolicy.view'), leaveRule.get);
 router.put('/leave-rules', p('rules.leavePolicy.edit'), leaveRule.update);
 
+router.get('/holiday-calendar-profiles', p('rules.holidays.view'), calendarProfile.list);
+router.post('/holiday-calendar-profiles', p('rules.holidays.edit'), calendarProfile.create);
+router.get('/employee-holiday-calendars', p('rules.holidays.view'), calendarProfile.assignments);
+router.put('/employee-holiday-calendars', p('rules.holidays.edit'), calendarProfile.assign);
 router.get('/holidays', p('rules.holidays.view'), holiday.list);
 router.post('/holidays', p('rules.holidays.edit'), holiday.create);
 router.put('/holidays/:id', p('rules.holidays.edit'), holiday.update);
@@ -254,6 +289,7 @@ router.get(
 router.get(
   '/reports/daily',
   p('reports.daily.view'),
+  dateQuery,
   report.daily
 );
 
@@ -347,6 +383,7 @@ router.attachBroadcaster = (app) => {
     const clients = app.locals.sseClients || new Set();
     for (const client of clients) {
       try {
+        if (!client.canSelectAttendanceDate && !isToday(record.timestamp)) continue;
         const allowed = client?.allowedEmployeeIds;
         if (Array.isArray(allowed) && !allowed.includes(String(record.employeeId))) continue;
         client.res.write(`data: ${JSON.stringify(record)}\n\n`);

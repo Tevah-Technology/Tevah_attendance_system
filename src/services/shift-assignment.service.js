@@ -8,13 +8,13 @@ function projectDayNumber(date) {
 async function getDefaultShift(employee) {
   if (employee?.shiftId) {
     const employeeShift = await Shift.findById(employee.shiftId).lean();
-    if (employeeShift?.active !== false) return employeeShift;
+    if (employeeShift && employeeShift.active !== false) return employeeShift;
   }
 
   const rule = await Rule.findOne().lean();
   if (rule?.defaultShiftId) {
     const defaultShift = await Shift.findById(rule.defaultShiftId).lean();
-    if (defaultShift?.active !== false) return defaultShift;
+    if (defaultShift && defaultShift.active !== false) return defaultShift;
   }
 
   return null;
@@ -62,11 +62,11 @@ async function getAssignmentForDate(employeeId, date = new Date()) {
 }
 
 async function getEffectiveShift(employee, date = new Date()) {
-  const assignment = await getAssignmentForDate(employee?.employeeId, date);
+  const assignment = await getAssignmentForDate(employee?.employeeId, require('../utils/employee-time').employeeLabel(date, employee));
 
   if (assignment) {
     const shift = await Shift.findById(assignment.shiftId).lean();
-    if (shift?.active !== false) {
+    if (shift && shift.active !== false) {
       return {
         shift,
         assignment,
@@ -140,7 +140,7 @@ async function createReportShiftResolver(employee, attendanceRule = {}) {
     if (assignment) {
       const shift = shiftMap.get(String(assignment.shiftId));
       // Preserve the existing getEffectiveShift behavior for missing shifts.
-      if (shift?.active !== false) {
+      if (shift && shift.active !== false) {
         return { shift, assignment, source: assignment.assignmentType };
       }
     }

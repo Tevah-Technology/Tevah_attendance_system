@@ -3,6 +3,8 @@ const { config, createDevice } = require('../config/zkteco');
 const { Attendance, Employee, Shift, Rule, RejectedPunch, EmployeePunchLock } = require('../models');
 const { stateToPunchType, verificationLabel, attendanceStateLabel } = require('../utils/punches');
 const { startOfDay, endOfDay } = require('../utils/time');
+const {employeeLabel,atLabel,groupPunches}=require('../utils/employee-time');
+const {effectiveRule}=require('./employee-rule.service');
 const { getAttendancePolicy, classifyDay } = require('../utils/attendance-policy');
 const { getEffectiveShift, getDefaultShift } = require('./shift-assignment.service');
 
@@ -54,10 +56,10 @@ async function getEmployeeShift(employee) {
   return getDefaultShift(employee);
 }
 
-async function getRule() {
+async function getRule(employee = null, at = null) {
   let rule = await Rule.findOne().lean();
   if (!rule) rule = (await Rule.create({})).toObject();
-  return rule;
+  return employee ? effectiveRule(employee,rule,at) : rule;
 }
 
 function timeOnDate(date, hhmm) {
@@ -68,23 +70,29 @@ function timeOnDate(date, hhmm) {
 }
 
 async function getShiftBoundaries(employee, timestamp, rule = null) {
-  rule = rule || await getRule();
+  rule = rule || await getRule(employee,timestamp);
   const at = new Date(timestamp);
   const effective = employee?.employeeId ? await getEffectiveShift(employee, at) : null;
   const shift = effective?.shift || null;
-  const shiftStart = timeOnDate(at, shift?.startTime || rule.morningStartTime || '09:00');
-  const shiftEnd = timeOnDate(at, shift?.endTime || rule.dayEndAutoCheckoutTime || '17:30');
-  if (shiftEnd <= shiftStart) shiftEnd.setDate(shiftEnd.getDate() + 1);
-  const lunchStart = timeOnDate(at, shift?.lunchStartTime || rule.middayAutoCheckoutTime || '13:00');
-  const lunchEnd = timeOnDate(at, shift?.lunchEndTime || rule.afternoonStartTime || '13:30');
+  if (shift?.shiftType === 'WORKING_HOURS_ONLY') return { shift, shiftSource: effective?.source, shiftStart: null, shiftEnd: null, lunchStart: null, lunchEnd: null, lunchValid: false };
+  const day = employeeLabel(at,employee);
+  const shiftStart = atLabel(day,shift?.startTime || rule.morningStartTime || '09:00',employee);
+  let shiftEnd = atLabel(day,shift?.endTime || rule.dayEndAutoCheckoutTime || '17:30',employee);
+  if (shiftEnd <= shiftStart) shiftEnd=atLabel(day,shift?.endTime || rule.dayEndAutoCheckoutTime || '17:30',employee,1);
+  const lunchStart = atLabel(day,shift?.lunchStartTime || rule.middayAutoCheckoutTime || '13:00',employee);
+  const lunchEnd = atLabel(day,shift?.lunchEndTime || rule.afternoonStartTime || '13:30',employee);
   const lunchValid = lunchStart > shiftStart && lunchEnd > lunchStart && lunchEnd < shiftEnd;
   return { shift, shiftSource: effective?.source || null, shiftStart, shiftEnd, lunchStart, lunchEnd, lunchValid };
 }
 
 async function getScheduledCheckoutAt(timestamp, employee = null) {
-  const rule = await getRule();
+  const rule = await getRule(employee,timestamp);
   const punchAt = new Date(timestamp);
   const t = await getShiftBoundaries(employee, punchAt, rule);
+  if (t.shift?.shiftType === 'WORKING_HOURS_ONLY') {
+    const limit = Number(t.shift.maximumSessionMinutes || 0);
+    return limit > 0 ? new Date(punchAt.getTime() + limit * 60000) : null;
+  }
   // Overtime re-entry after the regular shift is limited independently.
   if (rule.overtimeAutoCheckoutEnabled && punchAt >= t.shiftEnd) {
     return new Date(punchAt.getTime() + Number(rule.overtimeSessionLimitMinutes || 120) * 60000);
@@ -92,17 +100,17 @@ async function getScheduledCheckoutAt(timestamp, employee = null) {
   if (!rule.autoCheckoutEnabled) return null;
   if (rule.noonAutoCheckoutEnabled !== false && t.lunchValid && punchAt < t.lunchStart)
     return t.lunchStart;
-  if (rule.shiftEndAutoCheckoutEnabled || ['single_date','date_range','recurring'].includes(t.shiftSource)) {
+  if (rule.shiftEndAutoCheckoutEnabled || (employee?.timezone && t.shift) || ['single_date','date_range','recurring'].includes(t.shiftSource)) {
     if (punchAt < t.shiftEnd) return t.shiftEnd;
   } else {
-    const legacyEnd = timeOnDate(punchAt, rule.dayEndAutoCheckoutTime || '17:30');
+    const legacyEnd = atLabel(employeeLabel(punchAt,employee),rule.dayEndAutoCheckoutTime || '17:30',employee);
     if (punchAt < legacyEnd) return legacyEnd;
   }
   return null;
 }
 
 async function isBlockedLunchIn(employee, timestamp) {
-  const rule = await getRule();
+  const rule = await getRule(employee,timestamp);
   if (!rule.lunchClockInBlocked) return false;
   const boundaries = await getShiftBoundaries(employee, timestamp, rule);
   const at = new Date(timestamp);
@@ -110,17 +118,18 @@ async function isBlockedLunchIn(employee, timestamp) {
 }
 
 async function getRequiredMinutes(employee, date = new Date()) {
-  const rule = await getRule();
+  const rule = await getRule(employee,date);
 
   // Legacy-compatible flag name, but the value now comes from /api/rules.
   // true  -> use Rules.fullDayMinutes
   // false -> use the employee/default shift requiredMinutes
+  const effective = await getEffectiveShift(employee, date);
+  if (effective?.shift?.shiftType === 'WORKING_HOURS_ONLY') return Math.max(1, Number(effective.shift.requiredMinutes || 480));
   if (rule.attendanceUseEnvHours === true) {
     const configured = Number(rule.fullDayMinutes ?? 480);
     return Math.max(1, Number.isFinite(configured) ? configured : 480);
   }
 
-  const effective = await getEffectiveShift(employee, date);
   const required = Number(effective?.shift?.requiredMinutes ?? rule.fullDayMinutes ?? 480);
   return Math.max(1, Number.isFinite(required) ? required : 480);
 }
@@ -388,14 +397,19 @@ async function getTodayStatus(employeeId) {
   const employee = await Employee.findOne({ employeeId: String(employeeId) }).lean();
   if (!employee) throw new Error('Employee profile not found');
 
-  const from = startOfDay(new Date());
-  const to = endOfDay(new Date());
-  const punches = await Attendance.find({ employeeId: employee.employeeId, timestamp: { $gte: from, $lt: to } })
-    .sort({ timestamp: 1, _id: 1 }).lean();
-  // Match the global latest-punch rule used by createPunch. Today's punches
-  // alone would incorrectly show CHECKED OUT while yesterday's IN is still open.
-  const latest = await getLatestEmployeePunch(employee.employeeId);
-  const active = isActivePunch(latest);
+  const nowDate=new Date();
+  const localDay=employeeLabel(nowDate,employee);
+  const from=new Date(localDay.getTime()-3*86400000);
+  const to=new Date(localDay.getTime()+3*86400000);
+  const rawPunches=await Attendance.find({employeeId:employee.employeeId,timestamp:{$gte:from,$lt:to}}).sort({timestamp:1,_id:1}).lean();
+  const latest=await getLatestEmployeePunch(employee.employeeId);
+  const active=isActivePunch(latest);
+  const attendanceRule=await getRule(employee,nowDate);
+  const resolveShift=await require('./shift-assignment.service').createReportShiftResolver(employee,attendanceRule);
+  const grouped=groupPunches(rawPunches,employee,resolveShift);
+  let statusDay=localDay;
+  if(active && latest.timestamp){const day=employeeLabel(latest.timestamp,employee);if(resolveShift(day)?.shift?.shiftType==='WORKING_HOURS_ONLY')statusDay=day;}
+  const punches=grouped.get(statusDay.toISOString())||[];
   const firstIn = punches.find(p => p.punchType === 'IN') || null;
   const lastOut = [...punches].reverse().find(p => p.punchType === 'OUT') || null;
 
@@ -434,8 +448,9 @@ async function getTodayStatus(employeeId) {
     });
   }
 
-  const attendanceRule = await getRule();
-  const policy = getAttendancePolicy(attendanceRule);
+  const currentShift = resolveShift(statusDay)?.shift;
+  const hoursOnly = currentShift?.shiftType === 'WORKING_HOURS_ONLY';
+  const policy = getAttendancePolicy(hoursOnly ? {...attendanceRule, halfDayEnabled:false, halfDayMinutes:0, fullDayMinutes:currentShift.requiredMinutes, twoHalfDaysEqualOneDay:false} : attendanceRule);
   const completedIntervals = intervals.filter(i => !i.open);
   const intervalClassifications = completedIntervals.map(i => classifyDay({ workedMinutes: i.minutes, completedIntervals: 1, hasOpenInterval: false }, policy));
   let halfDayCount = 0;
@@ -464,15 +479,15 @@ async function getTodayStatus(employeeId) {
     dayClassification.fullDay = true;
   }
 
-  const requiredMinutes = await getRequiredMinutes(employee, new Date());
-  const overtimeMinutes = Math.max(0, workingMinutes - requiredMinutes);
+  const requiredMinutes = await getRequiredMinutes(employee, atLabel(statusDay,'12:00',employee));
+  const overtimeMinutes = (attendanceRule.overtimeEnabled === false || (hoursOnly && currentShift.enableOvertime === false)) ? 0 : Math.max(0, workingMinutes - requiredMinutes);
 
   // Reuse the report engine for today's final attendance credit and late-streak
   // penalty so the self-service status and reports cannot disagree.
   let reportRow = null;
   try {
     const { buildReport } = require('./report.service');
-    reportRow = (await buildReport({ from: new Date(), to: new Date(), employeeId: employee.employeeId }))[0] || null;
+    reportRow = (await buildReport({ from: statusDay, to: statusDay, employeeId: employee.employeeId }))[0] || null;
   } catch (error) {
     console.error('Today attendance classification error:', error.message);
   }
@@ -482,17 +497,19 @@ async function getTodayStatus(employeeId) {
   const afterLunch = boundaries.lunchValid && now >= boundaries.lunchEnd && now < boundaries.shiftEnd;
   const morningIN = punches.some(p => p.punchType === 'IN' && p.timestamp < boundaries.lunchStart);
   const lunchReturnWarning = afterLunch && morningIN && !active;
-  const overtimeSessionActive = active && lastPunchToday?.punchType === 'IN' &&
+  const overtimeSessionActive = !hoursOnly && active && lastPunchToday?.punchType === 'IN' &&
     new Date(lastPunchToday.timestamp) >= boundaries.shiftEnd;
   return {
     employeeId: employee.employeeId,
+    attendanceDate: require('../utils/employee-time').labelKey(statusDay),
+    timezone: employee.timezone || null,
     lunchReturnWarning,
     lunchReturnWarningText: lunchReturnWarning ? 'You have not clocked in after lunch. Please clock in to resume work.' : null,
     regularShiftEnd: boundaries.shiftEnd,
     overtimeSessionActive,
     overtimeAutoCheckoutAt: overtimeSessionActive ? (latest?.autoCheckoutAt || null) : null,
     attendanceNotice: overtimeSessionActive ? 'Overtime active. Your session will close at its configured limit.' :
-      now >= boundaries.shiftEnd ? 'Your regular shift has ended. Clock in again if you are continuing overtime.' : null,
+      !hoursOnly && now >= boundaries.shiftEnd ? 'Your regular shift has ended. Clock in again if you are continuing overtime.' : null,
     employeeName: employee.name,
     checkedIn: active,
     status: active ? 'IN_OFFICE' : (punches.length ? 'CHECKED_OUT' : 'NOT_CHECKED_IN'),
@@ -507,8 +524,9 @@ async function getTodayStatus(employeeId) {
     firstIn: firstIn?.timestamp || null,
     lastOut: lastOut?.timestamp || null,
     workingMinutes,
-    requiredMinutes,
-    overtimeMinutes,
+    requiredMinutes: reportRow?.requiredMinutes ?? requiredMinutes,
+    overtimeMinutes: reportRow?.overtimeMinutes ?? overtimeMinutes,
+    employeeExceptions: reportRow?.employeeExceptions || [],
     intervals,
     punches,
     activePunch: active ? latest : null,
@@ -542,7 +560,7 @@ async function rescheduleOpenSessions() {
 
 async function autoCheckoutOpenSessions(now = new Date()) {
   const rule = await getRule();
-  if (!rule.autoCheckoutEnabled && !rule.overtimeAutoCheckoutEnabled) return { checkedOut: 0, skipped: 0, candidates: 0, disabled: true };
+  // Per-shift session limits can remain enabled independently of company timing rules.
 
   const candidates = await Attendance.find({
     punchType: 'IN',
@@ -603,12 +621,12 @@ async function autoCheckoutOpenSessions(now = new Date()) {
 // Scheduler runs at the system's configured lunch end. Uses the exact configured
 // boundary (not the scheduler execution time) and only resumes an AUTO lunch OUT.
 async function autoLunchReturn(now = new Date()) {
-  const rule = await getRule();
-  if (!rule.autoLunchReturnEnabled || !rule.noonAutoCheckoutEnabled || !rule.autoCheckoutEnabled)
-    return { inserted: 0, disabled: true };
+  const companyRule=await getRule();
   const employees = await Employee.find({ active: true }).lean();
   let inserted = 0, skipped = 0;
   for (const employee of employees) {
+    const rule=await effectiveRule(employee,companyRule,now);
+    if (!rule.autoLunchReturnEnabled || !rule.noonAutoCheckoutEnabled || !rule.autoCheckoutEnabled) continue;
     const t = await getShiftBoundaries(employee, now, rule);
     if (!t.lunchValid || now < t.lunchEnd || now >= t.shiftEnd) continue;
     // Catch a missed run only in the small immediate post-lunch window.

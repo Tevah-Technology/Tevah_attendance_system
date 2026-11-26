@@ -58,6 +58,14 @@ function normalizePayload(body) {
   return out;
 }
 
+// Permanent bindings are projections of Employee.shiftId, not duplicate roster rows.
+function permanentBinding(employee) {
+  return { _id: `permanent:${employee._id}:${employee.shiftId._id || employee.shiftId}`,
+    employeeId: employee.employeeId, shiftId: employee.shiftId,
+    assignmentType: 'permanent', active: true, date: null, startDate: null,
+    endDate: null, recurringDays: [], notes: '' };
+}
+
 async function list(req, res) {
   try {
     const filter = {};
@@ -88,6 +96,12 @@ async function list(req, res) {
       .sort({ date: -1, startDate: -1, createdAt: -1 })
       .lean();
 
+    if (filter.active !== false) {
+      const employeeFilter = { shiftId: { $ne: null } };
+      if (filter.employeeId) employeeFilter.employeeId = filter.employeeId;
+      const employees = await Employee.find(employeeFilter).select('_id employeeId shiftId').populate('shiftId').lean();
+      assignments.push(...employees.filter(e => e.shiftId).map(permanentBinding));
+    }
     return res.json({ success: true, count: assignments.length, assignments });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message || 'Failed to load shift assignments' });
@@ -98,6 +112,17 @@ async function create(req, res) {
   try {
     const body = normalizePayload(req.body || {});
     body.assignmentType = body.assignmentType || 'single_date';
+    if (body.assignmentType === 'permanent') {
+      const employeeId = String(body.employeeId || '').trim();
+      if (!employeeId || !mongoose.Types.ObjectId.isValid(String(body.shiftId || ''))) {
+        return res.status(400).json({ success: false, message: 'employeeId and valid shiftId are required' });
+      }
+      const shift = await Shift.findById(body.shiftId).lean();
+      if (!shift || shift.active === false) return res.status(400).json({ success: false, message: 'Active shift required' });
+      const employee = await Employee.findOneAndUpdate({ employeeId }, { $set: { shiftId: shift._id } }, { new: true, runValidators: true }).select('_id employeeId shiftId').populate('shiftId').lean();
+      if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+      return res.status(201).json({ success: true, assignment: permanentBinding(employee) });
+    }
     const error = await validatePayload(body);
     if (error) return res.status(400).json({ success: false, message: error });
 
@@ -112,6 +137,7 @@ async function create(req, res) {
 
 async function update(req, res) {
   try {
+    if (req.params.id.startsWith('permanent:')) return res.status(400).json({ success: false, message: 'Replace a permanent assignment using POST or remove it using DELETE' });
     const current = await ShiftAssignment.findById(req.params.id).lean();
     if (!current) return res.status(404).json({ success: false, message: 'Shift assignment not found' });
 
@@ -134,6 +160,13 @@ async function update(req, res) {
 
 async function remove(req, res) {
   try {
+    if (req.params.id.startsWith('permanent:')) {
+      const [, employeeId, shiftId, extra] = req.params.id.split(':');
+      if (extra !== undefined || !mongoose.Types.ObjectId.isValid(employeeId) || !mongoose.Types.ObjectId.isValid(shiftId)) return res.status(400).json({ success: false, message: 'Invalid permanent binding ID' });
+      // Compare current shift so a stale binding cannot remove a replacement.
+      const result = await Employee.updateOne({ _id: employeeId, shiftId }, { $set: { shiftId: null } });
+      return res.json({ success: true, deleted: result.modifiedCount > 0 });
+    }
     const assignment = await ShiftAssignment.findByIdAndDelete(req.params.id).lean();
     return res.json({ success: true, deleted: Boolean(assignment) });
   } catch (error) {
@@ -150,8 +183,10 @@ async function resolve(req, res) {
     const employee = await Employee.findOne({ employeeId }).lean();
     if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    const result = await getEffectiveShift(employee, date);
-    return res.json({ success: true, employeeId, date: startOfDay(date), ...result });
+    const {atLabel,employeeLabel,labelDate}=require('../utils/employee-time');
+    const label=req.query.date ? (/^\d{4}-\d{2}-\d{2}$/.test(req.query.date)?labelDate(req.query.date):startOfDay(date)) : employeeLabel(new Date(),employee);
+    const result = await getEffectiveShift(employee,atLabel(label,'12:00',employee));
+    return res.json({ success: true, employeeId, date: label, ...result });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message || 'Failed to resolve shift' });
   }

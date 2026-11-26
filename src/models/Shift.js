@@ -20,15 +20,20 @@ const shiftSchema = new mongoose.Schema(
       trim: true,
     },
 
+    shiftType: { type: String, enum: ['FIXED', 'WORKING_HOURS_ONLY'], default: 'FIXED' },
+    maximumSessionMinutes: { type: Number, default: 0, min: 0, max: 1440, validate: Number.isInteger },
+
     startTime: {
       type: String,
-      required: true,
+      required: function () { return this.shiftType !== 'WORKING_HOURS_ONLY'; },
+      default: '',
       trim: true,
     },
 
     endTime: {
       type: String,
-      required: true,
+      required: function () { return this.shiftType !== 'WORKING_HOURS_ONLY'; },
+      default: '',
       trim: true,
     },
 
@@ -92,6 +97,8 @@ const shiftSchema = new mongoose.Schema(
       min: 1,
     },
 
+    weekdayMinutes: { type: mongoose.Schema.Types.Mixed, default: {} },
+    scheduleExceptions: { type: [mongoose.Schema.Types.Mixed], default: [] },
     workingDays: {
       type: [Number],
       default: [1, 2, 3, 4, 5, 6],

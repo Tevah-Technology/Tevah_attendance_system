@@ -1,5 +1,6 @@
-const { Leave, LeaveType, Employee } = require('../models');
-const { getLeaveRule, effectiveLeavePolicy } = require('./leave-rule.service');
+const {annualAllocation}=require('./employee-leave-allowance.service');
+const { Leave, LeaveType, Employee, EmployeeException } = require('../models');
+const { effectiveLeavePolicy, employeeLeaveRule } = require('./leave-rule.service');
 const { holidayDateKeys, startOfDay, dateKey, calendarKey } = require('./holiday.service');
 
 function yearBounds(year) {
@@ -60,7 +61,7 @@ function dayDiff(a, b) {
   return Math.floor((two - one) / 86400000);
 }
 
-async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = false, employee = null } = {}) {
+async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = false, employee = null, resolveShift = null, attendanceRule = {} } = {}) {
 
   const from = startOfDay(fromDate);
   const to = startOfDay(toDate);
@@ -68,6 +69,8 @@ async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = fal
     ? { exact: new Set(), recurring: new Set() }
     : await holidayDateKeys(from, to, employee);
 
+  const exceptions = employee?.employeeId && EmployeeException ? await EmployeeException.find({employeeId:String(employee.employeeId)}).lean() : [];
+  const {resolve}=require('./employee-exception.service');
   let excludedWeekends = 0;
   let excludedHolidays = 0;
   const chargeableDates = [];
@@ -75,8 +78,12 @@ async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = fal
 
   while (cursor <= to) {
     const exactKey = calendarKey(cursor);
-    const holiday = exact.has(exactKey) || recurring.has(dateKey(cursor));
-    const weekend = isWeekend(cursor);
+    const originalHoliday = exact.has(exactKey) || recurring.has(dateKey(cursor));
+    const shift=resolveShift?.(cursor)?.shift;
+    const day = require('./shift-schedule.service').resolveShiftSchedule(shift,exceptions,exactKey,Number(shift?.requiredMinutes??attendanceRule.fullDayMinutes??480),originalHoliday?{name:'Holiday'}:null);
+    const holiday = Boolean(day.holiday);
+    const normallyOff=Array.isArray(shift?.workingDays)?!shift.workingDays.includes(cursor.getDay()||7):isWeekend(cursor);
+    const weekend = day.holidayException?.mode === 'working' || day.working===true ? false : day.holidayException?.mode === 'off' || (!holiday&&day.working===false) ? true : normallyOff;
 
     if (!policy.includeWeekendsInLeaveDays && weekend) {
       excludedWeekends += 1;
@@ -114,7 +121,7 @@ async function previousYearCarryForward(employeeId, leaveType, year, rule) {
     ]
   }).lean();
   const used = leaves.reduce((sum, row) => sum + leaveDays(row), 0);
-  const unused = Math.max(0, Number(leaveType.annualAllocation || 0) - used);
+  const unused = Math.max(0, await annualAllocation(employeeId, leaveType, previous) - used);
   const typeLimit = leaveType.carryForwardLimitDays;
   const globalLimit = Number(rule.carryForwardLimitDays || 0);
   const limit = typeLimit !== null && typeLimit !== undefined
@@ -132,7 +139,7 @@ async function getEmployeeLeaveBalances(employeeId, year = new Date().getFullYea
       { fromDate: { $lt: end }, toDate: { $gte: start } },
       { fromDate: null, date: { $gte: start, $lt: end } }
     ] }).sort({ fromDate: -1, date: -1 }).lean(),
-    getLeaveRule()
+    employeeLeaveRule(employeeId, y)
   ]);
 
   const rows = [];
@@ -140,7 +147,7 @@ async function getEmployeeLeaveBalances(employeeId, year = new Date().getFullYea
     const matching = leaves.filter(l => String(l.leaveTypeId || '') === String(type._id));
     const used = matching.filter(l => l.status === 'APPROVED').reduce((sum, l) => sum + leaveDays(l), 0);
     const pending = matching.filter(l => l.status === 'PENDING').reduce((sum, l) => sum + leaveDays(l), 0);
-    const baseAllocated = Number(type.annualAllocation || 0);
+    const baseAllocated = await annualAllocation(employeeId, type, y);
     const carryForward = await previousYearCarryForward(employeeId, type, y, rule);
     const allocated = baseAllocated + carryForward;
     const policy = effectiveLeavePolicy(rule, type);
@@ -217,18 +224,18 @@ async function assertLeaveAvailable(employeeId, leaveType, requestedDays, status
   const { start, end } = yearBounds(year);
   const [existing, rule] = await Promise.all([
     getExistingUsage(employeeId, leaveType, start, end, options.excludeLeaveId),
-    getLeaveRule()
+    employeeLeaveRule(employeeId, year)
   ]);
   const used = existing.filter(l => l.status === 'APPROVED').reduce((s, l) => s + leaveDays(l), 0);
   const pending = existing.filter(l => l.status === 'PENDING').reduce((s, l) => s + leaveDays(l), 0);
   const carryForward = await previousYearCarryForward(employeeId, leaveType, year, rule);
-  const allocated = Number(leaveType.annualAllocation || 0) + carryForward;
+  const allocated = await annualAllocation(employeeId, leaveType, year) + carryForward;
   const policy = effectiveLeavePolicy(rule, leaveType);
   const available = allocated - used - pending;
   const negativeLimit = policy.negativeBalanceAllowed ? Number(policy.maxNegativeBalanceDays || 0) : 0;
   const allowedAvailable = available + negativeLimit;
 
-  if (requestedDays > allowedAvailable) {
+  if (requestedDays - allowedAvailable > 1e-9) {
     const error = errorWith(
       'LEAVE_BALANCE_EXCEEDED',
       `Insufficient ${leaveType.name} leave balance. Remaining: ${available} day(s), negative allowance: ${negativeLimit} day(s), requested: ${requestedDays} day(s).`,
@@ -252,12 +259,13 @@ async function assertLeaveAvailable(employeeId, leaveType, requestedDays, status
 }
 
 async function assertNoOverlap(employeeId, fromDate, toDate, excludeLeaveId = null) {
+  const end = new Date(toDate); end.setHours(23,59,59,999);
   const filter = {
     employeeId: String(employeeId),
     status: { $in: ['APPROVED', 'PENDING'] },
     $or: [
-      { fromDate: { $lte: toDate }, toDate: { $gte: fromDate } },
-      { fromDate: null, date: { $gte: fromDate, $lte: toDate } }
+      { fromDate: { $lte: end }, toDate: { $gte: fromDate } },
+      { fromDate: null, date: { $gte: fromDate, $lte: end } }
     ]
   };
   if (excludeLeaveId) filter._id = { $ne: excludeLeaveId };
@@ -299,13 +307,14 @@ async function validateLeaveRequest({
   fromDate,
   toDate,
   halfDay = false,
+  leaveMinutes = null,
   requestedStatus = 'PENDING',
   excludeLeaveId = null,
   documentSubmitted = false,
   isAdminGrant = false
 }) {
   const [rule, employee] = await Promise.all([
-    getLeaveRule(),
+    employeeLeaveRule(employeeId, new Date(fromDate).getFullYear()),
     Employee.findOne({ employeeId: String(employeeId) }).lean()
   ]);
   if (!employee) throw errorWith('EMPLOYEE_NOT_FOUND', 'Employee not found', 404);
@@ -347,7 +356,24 @@ async function validateLeaveRequest({
   }
 
   if (from.getFullYear() !== to.getFullYear()) throw errorWith('CROSS_YEAR_LEAVE', 'Split leave requests at the calendar year boundary.', 409);
-  const calculated = await calculateChargeableDays(from, to, policy, { halfDay, employee });
+  const {effectiveRule}=require('./employee-rule.service');
+  const {createReportShiftResolver}=require('./shift-assignment.service');
+  const attendanceRule=await effectiveRule(employee);
+  const resolveShift=await createReportShiftResolver(employee,attendanceRule);
+  const calculated = await calculateChargeableDays(from, to, policy, { halfDay, employee, resolveShift, attendanceRule });
+  let leaveTargetMinutes=null;
+  if (leaveMinutes!=null) {
+    if (!isAdminGrant && !excludeLeaveId) throw errorWith('HOUR_LEAVE_ADMIN_ONLY','Hour-based leave must be granted by an administrator',403);
+    if (halfDay || !Number.isInteger(leaveMinutes) || leaveMinutes<=0 || calendarKey(from)!==calendarKey(to) || calculated.chargeableDates.length!==1) throw errorWith('INVALID_HOUR_LEAVE','Choose one eligible working date and a positive number of minutes',409);
+    const {resolve,listForEmployee}=require('./employee-exception.service');
+    const shift=resolveShift(from).shift;
+    const holiday=await require('./holiday.service').isHolidayDate(from,employee);
+    const target=require('./shift-schedule.service').resolveShiftSchedule(shift,await listForEmployee(employee.employeeId),calendarKey(from),Number(shift?.requiredMinutes??attendanceRule.fullDayMinutes??480),holiday?{name:'Holiday'}:null);
+    const working=target.working??(!shift||!Array.isArray(shift.workingDays)||shift.workingDays.includes(from.getDay()||7));
+    if(!working||target.holiday||target.minutes<=0||leaveMinutes>=target.minutes)throw errorWith('INVALID_HOUR_LEAVE','Hourly leave must be shorter than the required hours of a working day. Use full-day leave otherwise.',409);
+    leaveTargetMinutes=target.minutes;
+    calculated.days=leaveMinutes/leaveTargetMinutes;
+  }
   if (calculated.days <= 0) {
     throw errorWith('NO_CHARGEABLE_LEAVE_DAYS', 'The selected range contains no chargeable leave days after weekend/holiday exclusions.', 409);
   }
@@ -356,7 +382,7 @@ async function validateLeaveRequest({
     throw errorWith('MAX_CONSECUTIVE_LEAVE_EXCEEDED', `Maximum consecutive leave is ${policy.maxConsecutiveDays} day(s).`, 409);
   }
 
-  if (rule.blockOverlappingRequests) {
+  if (rule.blockOverlappingRequests || leaveMinutes!=null || isAdminGrant) {
     await assertNoOverlap(employeeId, from, to, excludeLeaveId);
   }
   await assertMinimumGap(employeeId, from, to, Number(rule.minimumGapBetweenLeaveDays || 0), excludeLeaveId);
@@ -365,7 +391,7 @@ async function validateLeaveRequest({
   if (Number(policy.maxLeaveDaysPerMonth || 0) > 0) {
     const monthly = await getExistingUsage(employeeId, null, monthStart, monthEnd, excludeLeaveId);
     const usedMonth = monthly.reduce((sum, row) => sum + leaveDays(row), 0);
-    if (usedMonth + calculated.days > Number(policy.maxLeaveDaysPerMonth)) {
+    if (usedMonth + calculated.days - Number(policy.maxLeaveDaysPerMonth) > 1e-9) {
       throw errorWith('MONTHLY_LEAVE_LIMIT_EXCEEDED', `Monthly leave limit is ${policy.maxLeaveDaysPerMonth} day(s).`, 409, { used: usedMonth, requested: calculated.days });
     }
   }
@@ -374,7 +400,7 @@ async function validateLeaveRequest({
     const { start: yearStart, end: yearEnd } = yearBounds(from.getFullYear());
     const yearly = await getExistingUsage(employeeId, null, yearStart, yearEnd, excludeLeaveId);
     const usedYear = yearly.reduce((sum, row) => sum + leaveDays(row), 0);
-    if (usedYear + calculated.days > Number(policy.maxLeaveDaysPerYear)) {
+    if (usedYear + calculated.days - Number(policy.maxLeaveDaysPerYear) > 1e-9) {
       throw errorWith('YEARLY_LEAVE_LIMIT_EXCEEDED', `Yearly leave limit is ${policy.maxLeaveDaysPerYear} day(s).`, 409, { used: usedYear, requested: calculated.days });
     }
   }
@@ -401,8 +427,10 @@ async function validateLeaveRequest({
     policy,
     status,
     days: calculated.days,
+    leaveMinutes, leaveTargetMinutes,
     excludedWeekends: calculated.excludedWeekends,
     excludedHolidays: calculated.excludedHolidays,
+    chargeableDates: calculated.chargeableDates.map(calendarKey),
     documentRequired,
     documentSubmitted: Boolean(documentSubmitted),
     balance

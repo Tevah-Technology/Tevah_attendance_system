@@ -38,7 +38,7 @@ async function listActiveHolidays(fromDate, toDate, employee = null) {
     active: true,
     $or: [{ date: { $gte: from, $lte: to } }, { recurringAnnual: true }]
   }).sort({ date: 1 }).lean();
-  return rows.filter(h => {
+  const eligible = rows.filter(h => {
     if (employee && !employeeHolidayEligible(h, employee)) return false;
     if (!h.recurringAnnual) return true;
     const cursor = new Date(from);
@@ -48,6 +48,22 @@ async function listActiveHolidays(fromDate, toDate, employee = null) {
     }
     return false;
   });
+  if (!employee?.holidayCalendarAssignments?.length) return eligible;
+  const assignments=employee.holidayCalendarAssignments;
+  const profiles=await require('../models/HolidayCalendarProfile').find({_id:{$in:assignments.filter(a=>a.profileId).map(a=>a.profileId)}}).lean();
+  const resolved=[];
+  // Expand company annual holidays into date-specific occurrences so each year can use a different calendar.
+  for(const d=new Date(from);d<=to;d.setDate(d.getDate()+1)){
+    const a=assignments.find(x=>x.year===d.getFullYear());
+    const mode=a?.mode||'company';
+    if(mode==='company'||mode==='both') for(const h of eligible.filter(h=>holidayOccursOn(h,d)))resolved.push({...h,date:new Date(d),recurringAnnual:false});
+    if(mode==='custom'||mode==='both'){
+      const profile=profiles.find(p=>String(p._id)===String(a.profileId));
+      if(!profile)throw Error('Assigned holiday calendar not found');
+      for(const h of profile.holidays.filter(h=>h.date===calendarKey(d)))resolved.push({_id:`${profile._id}:${h.date}`,name:h.name,date:new Date(d),type:'COMPANY',active:true,appliesTo:'EMPLOYEES',employeeIds:[String(employee.employeeId)],recurringAnnual:false});
+    }
+  }
+  return resolved;
 }
 async function holidayDateKeys(fromDate, toDate, employee = null) {
   const holidays = await listActiveHolidays(fromDate, toDate, employee);

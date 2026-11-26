@@ -7,6 +7,7 @@ const { getEffectiveAccess } = require('../services/permission.service');
 function sanitizeRole(role, userCount = undefined) {
   const value = role.toObject ? role.toObject() : { ...role };
   delete value.__v;
+  if (value.code === 'SUPER_ADMIN') value.permissions = [...ALL_PERMISSIONS];
   if (userCount !== undefined) value.userCount = userCount;
   return value;
 }

@@ -72,7 +72,7 @@ async function summary(req, res) {
     const rows = await timedStep(
       requestId,
       'buildReport',
-      () => buildReport({ from: date, to: date, employeeIds })
+      () => buildReport({ from: date, to: date, employeeIds, includeAvatars: true })
     );
 
     const data = dedupeRowsByEmployee(rows);

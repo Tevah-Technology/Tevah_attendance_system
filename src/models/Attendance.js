@@ -36,6 +36,9 @@ const attendanceSchema = new mongoose.Schema({
   // Useful for the UI and reports without changing historical punch data.
   isAutoCheckout: { type: Boolean, default: false },
 
+  originalTimestamp: {type:Date,default:null},
+  originalSource: {type:String,default:null},
+  correctionHistory: [{oldTimestamp:Date,newTimestamp:Date,reason:String,actorId:String,at:Date}],
   correctionReason: { type: String, default: '' },
   correctedAt: { type: Date, default: null },
 

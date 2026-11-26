@@ -1,0 +1,14 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const {makeDaySummary}=require('../src/services/report.service');
+const {Shift}=require('../src/models');
+const date=new Date(2026,10,26);
+const at=(h,m=0)=>new Date(2026,10,26,h,m);
+const punch=(punchType,h,m)=>({punchType,timestamp:at(h,m)});
+const shift={shiftType:'WORKING_HOURS_ONLY',requiredMinutes:360,enableOvertime:true,workingDays:[1,2,3,4,5,6,7]};
+const row=(p,s=shift)=>makeDaySummary(date,p,{employeeId:'1',name:'Test'},s,null,{paidLunchEnabled:true,postShiftOvertimeEnabled:true,halfDayEnabled:true,fullDayMinutes:480});
+test('hours-only shift needs no scheduled times',()=>assert.equal(new Shift({name:'Flexible',...shift}).validateSync(),undefined));
+test('fixed shift still needs scheduled times',()=>assert.ok(new Shift({name:'Fixed'}).validateSync()));
+test('split sessions meet assigned hours without lateness or fixed lunch',()=>{const r=row([punch('IN',10),punch('OUT',13),punch('IN',16),punch('OUT',19)]);assert.equal(r.effectiveWorkedMinutes,360);assert.equal(r.attendanceDayStatus,'FULL_DAY');assert.equal(r.lateMinutes,0);assert.equal(r.earlyDepartureMinutes,0);assert.equal(r.overtimeMinutes,0);});
+test('shortfall remains incomplete',()=>{const r=row([punch('IN',10),punch('OUT',15)]);assert.equal(r.attendanceDayStatus,'INCOMPLETE');assert.equal(r.requiredMinutes,360);});
+test('overtime uses duration and can be disabled',()=>{const p=[punch('IN',10),punch('OUT',17)];assert.equal(row(p).overtimeMinutes,60);assert.equal(row(p,{...shift,enableOvertime:false}).overtimeMinutes,0);});
