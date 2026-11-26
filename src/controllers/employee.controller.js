@@ -2,6 +2,12 @@ const { Employee, AdminUser, Role, Settings } = require('../models');
 const deviceService = require('../services/device.service');
 const { restrictEmployeeFilter, assertEmployeeAllowed } = require('../services/access-scope.service');
 const { hashPassword } = require('../services/auth.service');
+const { validProfilePhoto, validAvatarGender } = require('../utils/profile-photo');
+
+function validateAvatarFields(data) {
+  if (Object.hasOwn(data, 'gender') && !validAvatarGender(data.gender)) throw new Error('Invalid avatar selection');
+  if (Object.hasOwn(data, 'profilePhoto') && !validProfilePhoto(data.profilePhoto)) throw new Error('Invalid profile photo (PNG/JPEG/WebP, maximum 128 KB)');
+}
 
 
 
@@ -277,6 +283,8 @@ async function create(req, res) {
       ...employeeData
     } = req.body || {};
 
+    if (Object.keys(employeeData).some(k => /^(timezone|ruleProfileId|ruleOverrides|holidayCalendarAssignments)(\.|$)/.test(k))) return res.status(400).json({success:false,message:'Create the employee first, then use the attendance-configuration endpoint'});
+    validateAvatarFields(employeeData);
     employee = await Employee.create(employeeData);
 
     if (shouldCreateLogin === true) {
@@ -340,6 +348,9 @@ async function update(req, res) {
     // An employee's personnel email and their application login email must not
     // diverge when edited from the employee details screen.
     const changes = { ...(req.body || {}) };
+    validateAvatarFields(changes);
+    // Attendance configuration must use its dedicated authorized endpoint.
+    if (Object.keys(changes).some(k => /^(timezone|ruleProfileId|ruleOverrides|holidayCalendarAssignments)(\.|$)/.test(k))) return res.status(400).json({success:false,message:'Use the attendance-configuration endpoint'});
     const login = await AdminUser.findOne({ employeeId: original.employeeId });
     const oldLoginEmail = login?.email;
     if (Object.prototype.hasOwnProperty.call(changes, 'email')) {

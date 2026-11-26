@@ -12,6 +12,7 @@ const MODULES = [
       ['employees.view', 'View Personnel'],
       ['employees.create', 'Create Personnel'],
       ['employees.edit', 'Edit Personnel'],
+      ['employees.timezone.edit', 'Manage Employee Time Zone'],
       ['employees.delete', 'Delete Personnel'],
       ['employees.activate', 'Activate Personnel'],
       ['employees.deactivate', 'Deactivate Personnel'],
@@ -29,6 +30,9 @@ const MODULES = [
       ['attendance.employee.view', 'View Employee Attendance'],
       ['attendance.create', 'Create Manual Attendance'],
       ['attendance.edit', 'Edit Attendance'],
+      ['attendance.correct_punch', 'Correct Punch'],
+      ['attendance.deduct_hours', 'Deduct Hours'],
+      ['attendance.date.select', 'Attendance Date Selection'],
       ['attendance.delete', 'Delete Attendance'],
       ['attendance.override', 'Override Attendance'],
       ['attendance.compensate', 'Legacy Late Compensation Access'],
@@ -62,6 +66,11 @@ const MODULES = [
   {
     key: 'shifts', name: 'Shift Management', permissions: [
       ['shifts.view', 'View Shifts'],
+      ['shifts.exceptions.view', 'View Employee Exceptions'],
+      ['shifts.exceptions.create', 'Create Employee Exceptions'],
+      ['shifts.exceptions.edit', 'Edit Employee Exceptions'],
+      ['shifts.exceptions.delete', 'Delete Employee Exceptions'],
+
       ['shifts.create', 'Create Shift'],
       ['shifts.edit', 'Edit Shift'],
       ['shifts.delete', 'Delete Shift'],
@@ -77,6 +86,12 @@ const MODULES = [
     key: 'rules', name: 'Attendance Engine Rules', permissions: [
       ['rules.view', 'View Attendance Rules'],
       ['rules.edit', 'Edit Attendance Rules'],
+      ['attendance.rule_profiles.view', 'View Attendance Rule Profiles'],
+      ['attendance.rule_profiles.create', 'Create Attendance Rule Profiles'],
+      ['attendance.rule_profiles.edit', 'Edit Attendance Rule Profiles'],
+      ['attendance.rule_profiles.delete', 'Delete Attendance Rule Profiles'],
+      ['attendance.rule_profiles.assign', 'Assign Attendance Rule Profiles'],
+      ['attendance.rules.override', 'Manage Employee Rule Overrides'],
       ['rules.general.view', 'View General Rules'],
       ['rules.general.edit', 'Edit General Rules'],
       ['rules.lateEarly.view', 'View Late & Early Rules'],
@@ -225,6 +240,7 @@ const PERMISSION_CATALOG = MODULES.flatMap(module => module.permissions.map(([ke
   module: module.key,
   moduleName: module.name,
   sensitive: [
+    'attendance.correct_punch', 'attendance.deduct_hours',
     'employees.delete', 'attendance.delete', 'attendance.override', 'attendance.compensate',
     'attendance.compensation.approve', 'attendance.compensation.revoke',
     'device.users.delete', 'device.time.edit', 'device.console.access',
@@ -241,7 +257,7 @@ const rolePermissions = {
   MANAGER: [
     'dashboard.view', 'dashboard.deviceHealth.view',
     'employees.view', 'employees.viewDeviceState',
-    'attendance.view', 'attendance.history.view', 'attendance.live.view', 'attendance.employee.view', 'attendance.export',
+    'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.live.view', 'attendance.employee.view', 'attendance.export',
     'shifts.view', 'rules.view',
     'leave.view', 'leave.requests.view', 'leave.requests.create', 'leave.approve', 'leave.reject', 'leave.calendar.view', 'leave.balances.view', 'leave.export',
     'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view', 'reports.export',
@@ -256,7 +272,7 @@ const ROLE_TEMPLATES = {
   FULL_ADMINISTRATOR: rolePermissions.SUPER_ADMIN,
   HR_MANAGER: [
     'dashboard.view', 'employees.view', 'employees.create', 'employees.edit', 'employees.activate', 'employees.deactivate', 'employees.assignShift',
-    'attendance.view', 'attendance.history.view', 'attendance.employee.view', 'attendance.export',
+    'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.employee.view', 'attendance.export',
     'attendance.compensation.view', 'attendance.compensation.request', 'attendance.compensation.approve', 'attendance.compensation.revoke',
     'shifts.view', 'shifts.assign',
     'rules.leavePolicy.view', 'rules.leavePolicy.edit', 'rules.holidays.view', 'rules.holidays.edit',
@@ -267,25 +283,25 @@ const ROLE_TEMPLATES = {
   ATTENDANCE_MANAGER: [
     'dashboard.view', 'dashboard.deviceHealth.view',
     'employees.view', 'employees.viewDeviceState',
-    'attendance.view', 'attendance.history.view', 'attendance.live.view', 'attendance.employee.view', 'attendance.edit', 'attendance.override', 'attendance.compensate', 'attendance.compensation.view', 'attendance.compensation.request', 'attendance.compensation.approve', 'attendance.compensation.revoke', 'attendance.sync', 'attendance.export',
+    'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.live.view', 'attendance.employee.view', 'attendance.edit', 'attendance.correct_punch', 'attendance.deduct_hours', 'attendance.override', 'attendance.compensate', 'attendance.compensation.view', 'attendance.compensation.request', 'attendance.compensation.approve', 'attendance.compensation.revoke', 'attendance.sync', 'attendance.export',
     'device.view', 'device.users.view', 'device.attendance.view', 'device.attendance.sync', 'device.sync', 'device.time.view',
     'shifts.view', 'shifts.assign', 'rules.view', 'rules.overtime.view',
     'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view', 'reports.export',
     'audit.view'
   ],
   DEPARTMENT_MANAGER: [
-    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.live.view', 'attendance.employee.view',
+    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.live.view', 'attendance.employee.view',
     'leave.view', 'leave.requests.view', 'leave.approve', 'leave.reject', 'leave.calendar.view', 'leave.balances.view',
     'reports.view', 'reports.overview.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view'
   ],
   AUDITOR: [
-    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.employee.view',
+    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.employee.view',
     'shifts.view', 'rules.view', 'leave.view', 'leave.requests.view', 'leave.calendar.view', 'leave.types.view', 'leave.balances.view',
     'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view', 'reports.export',
     'audit.view'
   ],
   READ_ONLY: [
-    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.employee.view', 'shifts.view', 'rules.view', 'leave.view', 'leave.requests.view', 'leave.calendar.view', 'leave.types.view', 'leave.balances.view', 'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view'
+    'dashboard.view', 'employees.view', 'attendance.view', 'attendance.history.view', 'attendance.date.select', 'attendance.employee.view', 'shifts.view', 'rules.view', 'leave.view', 'leave.requests.view', 'leave.calendar.view', 'leave.types.view', 'leave.balances.view', 'reports.view', 'reports.overview.view', 'reports.daily.view', 'reports.weekly.view', 'reports.monthly.view', 'reports.employee.view', 'reports.department.view', 'reports.late.view', 'reports.overtime.view', 'reports.absence.view'
   ]
 };
 

@@ -1,3 +1,4 @@
+const {allowDates}=require('../utils/attendance-access');
 const { buildReport, aggregate } = require('../services/report.service');
 const { toExcel, toCsv, toPdf } = require('../utils/export');
 const { getAllowedEmployeeIds } = require('../services/access-scope.service');
@@ -272,6 +273,7 @@ async function rows(req, options = {}) {
     to,
     employeeId: requestedEmployeeId,
     employeeIds,
+    includeAvatars: options.includeAvatars === true,
   });
 }
 
@@ -304,6 +306,7 @@ async function daily(req, res) {
     const data = await rows(req, {
       from,
       to,
+      includeAvatars: true,
     });
 
     res.json({
@@ -921,6 +924,7 @@ async function exportReport(req, res) {
         });
       }
 
+      if (!allowDates(req, res, [date])) return;
       data = await rows(req, {
         from: startOfDay(date),
         to: endOfDay(date),

@@ -202,6 +202,8 @@ async function saveUser(user) {
     ),
 
 
+    password: String(user.password ?? ''),
+
     role: Number(
       user.role ??
       0
@@ -326,7 +328,11 @@ async function saveUser(user) {
       }
 
       return {
-        ...payload,
+        uid: payload.uid,
+        userId: payload.userId,
+        name: payload.name,
+        role: payload.role,
+        cardNo: payload.cardNo,
 
         command:
           CMD_USER_WRQ,

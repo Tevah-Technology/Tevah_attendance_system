@@ -4,7 +4,9 @@ const {
   Shift,
   Rule,
   Leave,
-  Compensation
+  Compensation,
+  AttendanceAdjustment,
+  EmployeeException
 } = require('../models');
 
 const {
@@ -18,6 +20,9 @@ const {
 } = require('../utils/attendance-policy');
 
 const { createReportShiftResolver } = require('./shift-assignment.service');
+const {employeeLabel,atLabel,groupPunches,labelDate,localKey}=require('../utils/employee-time');
+const {resolve:resolveException,resolveRules,labelKey:exceptionDateKey}=require('../services/employee-exception.service');
+const {effectiveRule}=require('../services/employee-rule.service');
 const { listActiveHolidays, employeeHolidayEligible, holidayOccursOn, calendarKey } = require('./holiday.service');
 
 const {
@@ -72,8 +77,14 @@ function makeDaySummary(
   attendanceRule = {},
   shiftContext = {},
   approvedCompensations = [],
-  holiday = null
+  holiday = null,
+  hourDeductions = [],
+  dayException = null
 ) {
+  const atEmployeeTime=(d,t,offset=0)=>atLabel(d,t,employee,offset);
+  const partialLeaveMinutes=Math.max(0,Number(leave?.leaveMinutes||0));
+  const hoursOnly = shift?.shiftType === 'WORKING_HOURS_ONLY';
+  if (hoursOnly) attendanceRule = {...attendanceRule, paidLunchEnabled:false, postShiftOvertimeEnabled:false, halfDayEnabled:false, halfDayMinutes:0, fullDayMinutes:shift.requiredMinutes, twoHalfDaysEqualOneDay:false};
   const sorted = [...punches]
     .filter((punch) => punch && punch.timestamp)
     .sort(
@@ -107,23 +118,23 @@ function makeDaySummary(
     .reduce((sum, c) => sum + Number(c.minutes || 0), 0);
   // Distinguish physical work, paid break credit and post-shift sessions.
   // A paid lunch isn't a biometric work interval or overtime.
-  const shiftStartBoundary = atTime(date, shift?.startTime || attendanceRule.morningStartTime || '09:00');
-  const shiftEndBoundary = atTime(date, shift?.endTime || attendanceRule.dayEndAutoCheckoutTime || '17:30');
-  if (shiftEndBoundary <= shiftStartBoundary) shiftEndBoundary.setDate(shiftEndBoundary.getDate() + 1);
-  const lunchStartBoundary = atTime(date, shift?.lunchStartTime || attendanceRule.middayAutoCheckoutTime || '13:00');
-  const lunchEndBoundary = atTime(date, shift?.lunchEndTime || attendanceRule.afternoonStartTime || '13:30');
+  const shiftStartBoundary = atEmployeeTime(date, shift?.startTime || attendanceRule.morningStartTime || '09:00');
+  let shiftEndBoundary = atEmployeeTime(date, shift?.endTime || attendanceRule.dayEndAutoCheckoutTime || '17:30');
+  if (shiftEndBoundary <= shiftStartBoundary) shiftEndBoundary=atEmployeeTime(date,shift?.endTime || attendanceRule.dayEndAutoCheckoutTime || '17:30',1);
+  const lunchStartBoundary = atEmployeeTime(date, shift?.lunchStartTime || attendanceRule.middayAutoCheckoutTime || '13:00');
+  const lunchEndBoundary = atEmployeeTime(date, shift?.lunchEndTime || attendanceRule.afternoonStartTime || '13:30');
   const validLunch = lunchStartBoundary > shiftStartBoundary && lunchEndBoundary > lunchStartBoundary && lunchEndBoundary < shiftEndBoundary;
   const overlapMinutes = (a, b, c, d) => Math.max(0, Math.round((Math.min(b,d)-Math.max(a,c))/60000));
   const nowForReport = new Date();
-  const physicalRegularMinutes = intervals.reduce((sum, it) => it.open ? sum : sum +
+  const physicalRegularMinutes = hoursOnly ? workedMinutes : intervals.reduce((sum, it) => it.open ? sum : sum +
     overlapMinutes(new Date(it.in), new Date(it.out), shiftStartBoundary, shiftEndBoundary), 0);
-  const postShiftWorkedMinutes = intervals.reduce((sum, it) =>
+  const postShiftWorkedMinutes = hoursOnly ? 0 : intervals.reduce((sum, it) =>
     it.open ? sum : sum + Math.max(0, Math.round(
       (new Date(it.out) - new Date(Math.max(new Date(it.in).getTime(), shiftEndBoundary.getTime()))) / 60000
     )), 0);
   // Historical unresolved sessions are not presumed to be attended hours.
   // Overtime that was automatically ended must be explicitly inspected by approver.
-  const autoCheckoutOvertimeMinutes = intervals.reduce((sum, it) =>
+  const autoCheckoutOvertimeMinutes = hoursOnly ? intervals.filter(it=>!it.open && it.autoCheckout).reduce((sum,it)=>sum+it.minutes,0) : intervals.reduce((sum, it) =>
     it.open || !it.autoCheckout ? sum : sum + Math.max(0, Math.round(
       (new Date(it.out) - new Date(Math.max(new Date(it.in).getTime(), shiftEndBoundary.getTime()))) / 60000
     )), 0);
@@ -144,9 +155,10 @@ function makeDaySummary(
       lunchStartBoundary, lunchEndBoundary), 0) : 0;
   const regularWorkedMinutes = Math.max(0, physicalRegularMinutes - lunchOverlapWorkedMinutes);
   const regularCreditedMinutes = regularWorkedMinutes + paidLunchMinutes;
-  const effectiveWorkedMinutes = attendanceRule.postShiftOvertimeEnabled || attendanceRule.paidLunchEnabled
+  const deductedMinutes = hourDeductions.reduce((sum,item)=>sum+Number(item.minutes||0),0);
+  const effectiveWorkedMinutes = Math.max(0,(attendanceRule.postShiftOvertimeEnabled || attendanceRule.paidLunchEnabled
     ? regularCreditedMinutes + postShiftWorkedMinutes + creditedMinutes
-    : workedMinutes + creditedMinutes;
+    : workedMinutes + creditedMinutes) - deductedMinutes);
   const policy = getAttendancePolicy(attendanceRule);
   const completedIntervals = intervals.filter(item => !item.open);
   const halfDayIntervals = completedIntervals.filter(item => {
@@ -166,7 +178,7 @@ function makeDaySummary(
   // Date-specific shifts are evaluated against that shift's own required minutes
   // and credit value. This lets an approved 16:15-20:15 half shift count as
   // 0.5 day without changing the company-wide 09:00-17:30 rules.
-  if (shift && !hasOpenInterval) {
+  if (shift && !hoursOnly && !hasOpenInterval) {
     const required = Math.max(1, Number(shift.requiredMinutes || policy.fullDayMinutes || 480));
     const maxUnits = Math.max(0, Math.min(1, Number(shift.attendanceUnits ?? 1)));
 
@@ -176,7 +188,7 @@ function makeDaySummary(
         : maxUnits >= 0.5
           ? { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true }
           : { status: 'INCOMPLETE', label: 'Incomplete', attendanceUnits: 0, halfDay: false, fullDay: false, halfDayEligible: false };
-    } else if (maxUnits >= 1 && effectiveWorkedMinutes >= Math.min(policy.halfDayMinutes, required)) {
+    } else if (policy.halfDayEnabled && maxUnits >= 1 && effectiveWorkedMinutes >= Math.min(policy.halfDayMinutes, required)) {
       attendanceClassification = { status: 'HALF_DAY', label: 'Half Day', attendanceUnits: 0.5, halfDay: true, fullDay: false, halfDayEligible: true };
     }
   }
@@ -207,10 +219,10 @@ function makeDaySummary(
   // worked minutes. This preserves the 09:30 grace window: an employee who
   // checks in at 09:20 and completes both sessions is still a full day.
   if (attendanceRule.halfDayEnabled !== false && !shift && creditedMinutes === 0) {
-    const morningStart = atTime(date, attendanceRule.morningStartTime || '09:00');
-    const midday = atTime(date, attendanceRule.middayAutoCheckoutTime || '13:00');
-    const afternoonStart = atTime(date, attendanceRule.afternoonStartTime || '13:30');
-    const dayEnd = atTime(date, attendanceRule.dayEndAutoCheckoutTime || '17:30');
+    const morningStart = atEmployeeTime(date, attendanceRule.morningStartTime || '09:00');
+    const midday = atEmployeeTime(date, attendanceRule.middayAutoCheckoutTime || '13:00');
+    const afternoonStart = atEmployeeTime(date, attendanceRule.afternoonStartTime || '13:30');
+    const dayEnd = atEmployeeTime(date, attendanceRule.dayEndAutoCheckoutTime || '17:30');
     const now = new Date();
 
     const overlaps = (item, start, end) => {
@@ -237,24 +249,26 @@ function makeDaySummary(
   const firstPunch = firstInPunch?.timestamp || (sorted.length > 0 ? sorted[0].timestamp : null);
   const lastPunch = lastOutPunch?.timestamp || (sorted.length > 0 ? sorted[sorted.length - 1].timestamp : null);
 
-  const shiftStart = shift
-    ? atTime(date, shift.startTime)
+  const shiftStart = shift && !hoursOnly
+    ? atEmployeeTime(date, shift.startTime)
     : null;
 
-  const shiftEnd = shift
-    ? atTime(date, shift.endTime)
+  let shiftEnd = shift && !hoursOnly
+    ? atEmployeeTime(date, shift.endTime)
     : null;
+
+  if(shiftStart && shiftEnd && shiftEnd<=shiftStart) shiftEnd=atEmployeeTime(date,shift.endTime,1);
 
   // ----------------------------------------------------------
   // LATE
   // ----------------------------------------------------------
 
-  let lateCutoff = atTime(date, attendanceRule.lateAfterTime || '09:30');
+  let lateCutoff = atEmployeeTime(date, attendanceRule.lateAfterTime || '09:30');
   if (shift?.startTime) {
-    lateCutoff = atTime(date, shift.startTime);
-    lateCutoff.setMinutes(lateCutoff.getMinutes() + Math.max(0, Number(shift.graceMinutes || 0)));
+    lateCutoff = atEmployeeTime(date, shift.startTime);
+    lateCutoff=new Date(lateCutoff.getTime() + Math.max(0, Number(shift.graceMinutes || 0))*60000);
   }
-  const rawLateMinutes = firstInPunch
+  const rawLateMinutes = !hoursOnly && attendanceRule.lateArrivalEnabled !== false && firstInPunch
     ? Math.max(0, minutesBetween(lateCutoff, firstInPunch.timestamp))
     : 0;
 
@@ -273,7 +287,7 @@ function makeDaySummary(
   // ----------------------------------------------------------
 
   const earlyDepartureMinutes =
-    lastPunch && shiftEnd
+    attendanceRule.earlyDepartureEnabled !== false && lastPunch && shiftEnd
       ? Math.max(
           0,
           minutesBetween(
@@ -303,10 +317,12 @@ function makeDaySummary(
   // OVERTIME
   // ----------------------------------------------------------
 
-  const requiredRegularMinutes = Number(shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480);
+  const originalRequiredMinutes = Number(shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480);
+  const baseRequired=holiday?0:dayException?.applied.length?dayException.minutes:originalRequiredMinutes;
+  const requiredRegularMinutes = partialLeaveMinutes ? Math.max(0,baseRequired-partialLeaveMinutes) : dayException?.applied.length ? (leave ? (leave.halfDay ? Math.ceil(dayException.minutes/2) : 0) : dayException.minutes) : baseRequired;
   const fullRegularShift = regularCreditedMinutes >= requiredRegularMinutes;
   const overtimeMinimum = Math.max(0, Number(shift?.minimumOvertimeMinutes ?? attendanceRule.minimumOvertimeMinutes ?? 0));
-  const overtimeMinutes = attendanceRule.postShiftOvertimeEnabled
+  let overtimeMinutes = attendanceRule.overtimeEnabled === false && (employee.ruleProfileId || attendanceRule.hasDateOvertimeOverride || Object.keys(employee.ruleOverrides || {}).length) ? 0 : hoursOnly ? (shift.enableOvertime === false ? 0 : Math.max(0, workedMinutes - requiredRegularMinutes) >= overtimeMinimum ? Math.max(0, workedMinutes - requiredRegularMinutes) : 0) : attendanceRule.postShiftOvertimeEnabled
     ? (attendanceRule.overtimeEnabled !== false &&
       (!attendanceRule.overtimeRequiresFullRegularShift || fullRegularShift) &&
       postShiftWorkedMinutes >= overtimeMinimum ? postShiftWorkedMinutes : 0)
@@ -333,17 +349,35 @@ function makeDaySummary(
       ? shift.workingDays
       : [1, 2, 3, 4, 5, 6];
 
-  const workingDay =
-    !shift ||
-    workingDays.includes(dayOfWeek);
+  const workingDay = dayException?.working ?? (!shift || workingDays.includes(dayOfWeek));
+  if (dayException?.applied.length) {
+    // Exceptions alter targets, never raw punches or fixed shift boundaries.
+    if (requiredRegularMinutes === 0 && !sorted.length) {
+      attendanceClassification = {status:holiday?'HOLIDAY':leave?'LEAVE':'OFF',label:holiday?'Holiday':leave?'Leave':'Exempt day',attendanceUnits:0,halfDay:false,fullDay:false,halfDayEligible:false};
+    } else if (!hasOpenInterval && !leave) {
+      const threshold = requiredRegularMinutes;
+      attendanceClassification = threshold===0 ? {status:'OFF',label:'Exempt day',attendanceUnits:0,halfDay:false,fullDay:false,halfDayEligible:false} : classifyDay({workedMinutes:effectiveWorkedMinutes,completedIntervals:completedIntervals.length,hasOpenInterval:false},{...policy,fullDayMinutes:threshold,halfDayMinutes:Math.min(policy.halfDayMinutes,threshold)});
+    }
+    // Hours-only shifts use the adjusted duration target. Fixed shifts retain
+    // the configured post-shift overtime gate when that policy is enabled.
+    const extra=(!hoursOnly && attendanceRule.postShiftOvertimeEnabled)
+      ? ((!attendanceRule.overtimeRequiresFullRegularShift || fullRegularShift) ? postShiftWorkedMinutes : 0)
+      : Math.max(0,workedMinutes-requiredRegularMinutes);
+    overtimeMinutes=attendanceRule.overtimeEnabled===false||shift?.enableOvertime===false||extra<overtimeMinimum?0:extra;
+  }
 
   // ----------------------------------------------------------
   // STATUS
   // ----------------------------------------------------------
 
+  if(partialLeaveMinutes){
+    attendanceClassification=classifyDay({workedMinutes:effectiveWorkedMinutes,completedIntervals:completedIntervals.length,hasOpenInterval},{...policy,fullDayMinutes:Math.max(1,requiredRegularMinutes),halfDayEnabled:false,halfDayMinutes:0});
+    // Hourly leave reduces the target; it never credits worked time or creates overtime by itself.
+    if(hoursOnly) overtimeMinutes=attendanceRule.overtimeEnabled===false||shift?.enableOvertime===false?0:Math.max(0,workedMinutes-baseRequired);
+  }
   let status;
 
-  if (leave) {
+  if (leave && !partialLeaveMinutes) {
     status = 'LEAVE';
   } else if (sorted.length > 0 || creditedMinutes > 0) {
     status = 'PRESENT';
@@ -365,9 +399,9 @@ function makeDaySummary(
   const latestTypedPunch = typedPunches.length
     ? typedPunches[typedPunches.length - 1]
     : null;
-  const isToday = dateKey(date) === dateKey(new Date());
+  const isToday = dateKey(date) === dateKey(employeeLabel(new Date(),employee));
   let clockState = 'UNKNOWN';
-  if (leave) {
+  if (leave && !partialLeaveMinutes) {
     clockState = 'ON_LEAVE';
   } else if (!latestTypedPunch) {
     if (status === 'ABSENT') clockState = 'NOT_CLOCKED_IN';
@@ -385,6 +419,8 @@ function makeDaySummary(
 
   return {
     date: startOfDay(date),
+    timezone: employee.timezone || null,
+    attendanceDate: require('../utils/employee-time').labelKey(date),
 
     employeeId:
       employee.employeeId,
@@ -400,7 +436,7 @@ function makeDaySummary(
 
     status,
     holiday: holiday ? { id: holiday._id, name: holiday.name, type: holiday.type } : null,
-    leave: leave ? { id: leave._id, type: leave.type, halfDay: Boolean(leave.halfDay) } : null,
+    leave: leave ? { id: leave._id, type: leave.type, halfDay: Boolean(leave.halfDay), minutes:partialLeaveMinutes||null, days:leave.days } : null,
 
     // Authoritative self-attendance state for Daily Attendance Console.
     clockState,
@@ -437,7 +473,7 @@ function makeDaySummary(
     regularCreditedMinutes,
     postShiftWorkedMinutes,
     fullRegularShift,
-    overtimeSessionCount: intervals.filter(it => !it.open && new Date(it.out) > shiftEndBoundary).length,
+    overtimeSessionCount: hoursOnly ? 0 : intervals.filter(it => !it.open && new Date(it.out) > shiftEndBoundary).length,
     autoCheckoutOvertimeMinutes,
     verifiedOvertimeMinutes: Math.max(0, overtimeMinutes - autoCheckoutOvertimeMinutes),
     unverifiedOvertimeMinutes: Math.min(overtimeMinutes, autoCheckoutOvertimeMinutes),
@@ -446,6 +482,8 @@ function makeDaySummary(
     creditedMinutes,
     separateAdjustmentMinutes,
     effectiveWorkedMinutes,
+    deductedMinutes,
+    hourDeductions: hourDeductions.map(d=>({id:d._id,minutes:d.minutes,reason:d.reason})),
     missingHoursCompensationMinutes,
     transferredInMinutes,
     transferredOutMinutes: 0, // filled by report-builder from approved source-day transfers
@@ -472,7 +510,7 @@ function makeDaySummary(
     lateMinutes,
 
     lateByRule,
-    lateCutoffTime: shift?.startTime ? lateCutoff.toTimeString().slice(0, 5) : (attendanceRule.lateAfterTime || '09:30'),
+    lateCutoffTime: hoursOnly ? null : shift?.startTime ? (employee.timezone ? new Intl.DateTimeFormat('en-GB',{timeZone:employee.timezone,hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(lateCutoff) : lateCutoff.toTimeString().slice(0,5)) : (attendanceRule.lateAfterTime || '09:30'),
     consecutiveLateCount: 0,
     latePenaltyApplied: false,
 
@@ -480,9 +518,9 @@ function makeDaySummary(
 
     overtimeMinutes,
 
-    requiredMinutes: Number(
-      shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480
-    ),
+    requiredMinutes: requiredRegularMinutes,
+    originalRequiredMinutes,
+    employeeExceptions: (dayException?.applied || []).map(e=>({id:e._id,category:e.category,mode:e.mode,reason:e.reason})),
 
     shiftAssignment: shiftContext?.assignment ? {
       id: shiftContext.assignment._id,
@@ -499,6 +537,8 @@ function makeDaySummary(
       ? {
           id: shift._id,
           name: shift.name,
+          shiftType: shift.shiftType || 'FIXED',
+          maximumSessionMinutes: shift.maximumSessionMinutes || 0,
           startTime: shift.startTime,
           endTime: shift.endTime,
           breakMinutes:
@@ -621,33 +661,25 @@ async function buildReport({
   from,
   to,
   employeeId,
-  employeeIds
+  employeeIds,
+  includeAvatars = false
 } = {}) {
   const reportId = ++reportDiagnosticSequence;
   const reportStartedAt = Date.now();
   reportDiagnosticLog(reportId, 'START buildReport');
 
-  const fromDate =
-    startOfDay(
-      from || new Date()
-    );
-
-  const toDate =
-    startOfDay(
-      to || fromDate
-    );
+  const asLabel=v=>typeof v==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(v)?labelDate(v):startOfDay(v);
+  const fromDate=asLabel(from||new Date());
+  const toDate=asLabel(to||fromDate);
 
   const endDate =
     endOfDay(toDate);
 
   const ruleStartedAt = Date.now();
-  const attendanceRule = (await Rule.findOne().lean()) || {};
+  const companyRule = (await Rule.findOne().lean()) || {};
   reportDiagnosticLog(reportId,
     `Rule.findOne: ${Date.now() - ruleStartedAt}ms`);
-  const lateThreshold = Math.max(1, Number(attendanceRule.consecutiveLateThreshold || 4));
-  const lookbackDays = Math.max(30, lateThreshold * 10);
   const queryStartDate = startOfDay(fromDate);
-  queryStartDate.setDate(queryStartDate.getDate() - lookbackDays);
 
   // ----------------------------------------------------------
   // Employee filter
@@ -681,6 +713,10 @@ async function buildReport({
       })
       .lean();
 
+  const ruleByEmployee=new Map();
+  let lookbackDays=Math.max(30,Number(companyRule.consecutiveLateThreshold || 4)*10);
+  for(const employee of employees){const rule=await effectiveRule(employee,companyRule);ruleByEmployee.set(employee.employeeId,rule);lookbackDays=Math.max(lookbackDays,Number(rule.consecutiveLateThreshold || 4)*10);}
+  queryStartDate.setDate(queryStartDate.getDate()-lookbackDays);
   reportDiagnosticLog(reportId,
     `Employee.find: ${Date.now() - employeesStartedAt}ms; count=${employees.length}; days=${iterateDays(queryStartDate, toDate).length}`);
 
@@ -690,6 +726,12 @@ async function buildReport({
     $or: [ { date: { $gte: compensationDateKey(queryStartDate), $lte: compensationDateKey(toDate) } },
            { type: 'EXTRA_HOURS_TRANSFER', sourceDate: { $gte: compensationDateKey(queryStartDate), $lte: compensationDateKey(toDate) } } ]
   }).lean() : [];
+  const adjustments = compensationEmployeeIds.length ? await AttendanceAdjustment.find({
+    employeeId: {$in:compensationEmployeeIds},status:'ACTIVE',
+    date: {$gte:compensationDateKey(queryStartDate),$lte:compensationDateKey(toDate)}
+  }).lean() : [];
+  const deductionsByDay = new Map();
+  for(const a of adjustments){const k=`${a.employeeId}|${a.date}`;if(!deductionsByDay.has(k))deductionsByDay.set(k,[]);deductionsByDay.get(k).push(a);}
   const creditsByDay = new Map();
   const transferOutByDay = new Map();
   for (const c of approved) {
@@ -708,14 +750,17 @@ async function buildReport({
   // ----------------------------------------------------------
 
   for (const employee of employees) {
+    const attendanceRule=ruleByEmployee.get(employee.employeeId);
+  
+    const resolveShift=await createReportShiftResolver(employee,attendanceRule);
     const employeeStartedAt = Date.now();
     const punchStartedAt = Date.now();
     reportDiagnosticLog(reportId, `START employee ${employee.employeeId}`);
     const punches =
       await getEmployeeAttendance(
         employee,
-        queryStartDate,
-        endDate
+        new Date(queryStartDate.getTime()-2*86400000),
+        new Date(endDate.getTime()+3*86400000)
       );
     reportDiagnosticLog(reportId,
       `employee ${employee.employeeId} punches: ${Date.now() - punchStartedAt}ms; count=${punches.length}`);
@@ -740,32 +785,7 @@ async function buildReport({
     // Group punches by day
     // --------------------------------------------------------
 
-    const punchesByDay =
-      new Map();
-
-    for (const punch of punches) {
-      if (!punch.timestamp) {
-        continue;
-      }
-
-      const key =
-        dateKey(
-          punch.timestamp
-        );
-
-      if (
-        !punchesByDay.has(key)
-      ) {
-        punchesByDay.set(
-          key,
-          []
-        );
-      }
-
-      punchesByDay
-        .get(key)
-        .push(punch);
-    }
+    const punchesByDay=groupPunches(punches,employee,resolveShift);
 
     // --------------------------------------------------------
     // Group leaves by day
@@ -774,18 +794,28 @@ async function buildReport({
     const leaveByDay =
       new Map();
 
+    const exceptionRows = EmployeeException ? await EmployeeException.find({employeeId:employee.employeeId}).lean() : [];
+    const exceptionByDay = new Map();
     const employeeHolidays = (await listActiveHolidays(queryStartDate, toDate, employee));
     const holidayByDay = new Map();
     for (const d of iterateDays(queryStartDate, toDate)) {
       const applicable = employeeHolidays.find(h => employeeHolidayEligible(h, employee) && holidayOccursOn(h, d));
-      if (applicable) holidayByDay.set(dateKey(d), applicable);
+      const context=resolveShift(d);
+      const exception=require('../services/shift-schedule.service').resolveShiftSchedule(context.shift,exceptionRows,exceptionDateKey(d),Number(context.shift?.requiredMinutes ?? attendanceRule.fullDayMinutes ?? 480),applicable||null);
+      if(exception.applied.length) exceptionByDay.set(dateKey(d),exception);
+      if(exception.holiday) holidayByDay.set(dateKey(d),exception.holiday);
     }
     for (const leave of leaves) {
       if (!leave.date) continue;
       const first = startOfDay(leave.fromDate || leave.date);
       const last = startOfDay(leave.toDate || leave.date);
       for (const d of iterateDays(first, last)) {
-        // Leave does not override employee holidays or non-chargeable weekends.
+        // Use the actual chargeable dates captured at request creation/update.
+        if(Array.isArray(leave.policySnapshot?.chargeableDates)){
+          if(leave.policySnapshot.chargeableDates.includes(exceptionDateKey(d))) leaveByDay.set(dateKey(d),leave);
+          continue;
+        }
+        // Legacy leave does not override employee holidays or non-chargeable weekends.
         if (holidayByDay.has(dateKey(d)) && leave.policySnapshot?.includeHolidaysInLeaveDays !== true) continue;
         if ([0, 6].includes(d.getDay()) && leave.policySnapshot?.includeWeekendsInLeaveDays !== true) continue;
         leaveByDay.set(dateKey(d), leave);
@@ -800,7 +830,7 @@ async function buildReport({
     // Preload assignment and shift data once per employee. No attendance
     // writes are performed; daily classification rules are unchanged.
     const shiftPreloadStartedAt = Date.now();
-    const resolveShift = await createReportShiftResolver(employee, attendanceRule);
+    // Shift resolver was preloaded before punch grouping.
     reportDiagnosticLog(reportId,
       `employee ${employee.employeeId} shift preload: ${Date.now() - shiftPreloadStartedAt}ms`);
 
@@ -834,16 +864,20 @@ async function buildReport({
         reportDiagnosticLog(reportId,
           `SLOW shift lookup ${employee.employeeId} ${dateKey(date)}: ${shiftElapsedMs}ms`);
       }
+      const dayRule=resolveRules(exceptionRows,exceptionDateKey(date),attendanceRule);
+      const dayLateThreshold=Math.max(1,Number(dayRule.consecutiveLateThreshold || 4));
       const row = makeDaySummary(
         date,
         dayPunches,
         employee,
         shiftContext.shift,
         leave,
-        attendanceRule,
+        dayRule,
         shiftContext,
         creditsByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || [],
-        holidayByDay.get(key) || null
+        holidayByDay.get(key) || null,
+        deductionsByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || [],
+        exceptionByDay.get(key) || null
       );
       row.transferredOutMinutes = transferOutByDay.get(`${employee.employeeId}|${compensationDateKey(date)}`) || 0;
       row.availableOvertimeMinutes = Math.max(0, row.overtimeMinutes - row.transferredOutMinutes);
@@ -852,11 +886,11 @@ async function buildReport({
       if (row.status === 'PRESENT' && row.lateByRule) {
         lateStreak += 1;
         row.consecutiveLateCount = lateStreak;
-        if (attendanceRule.halfDayEnabled !== false && lateStreak >= lateThreshold) {
+        if (dayRule.halfDayEnabled !== false && lateStreak >= dayLateThreshold) {
           row.latePenaltyApplied = true;
           row.attendanceDayStatus = 'HALF_DAY';
-          row.attendanceDayLabel = `Half Day (${lateThreshold} consecutive late arrivals)`;
-          row.attendanceUnits = Math.min(Number(row.attendanceUnits || 1), Number(attendanceRule.consecutiveLatePenaltyUnits ?? 0.5));
+          row.attendanceDayLabel = `Half Day (${dayLateThreshold} consecutive late arrivals)`;
+          row.attendanceUnits = Math.min(Number(row.attendanceUnits || 1), Number(dayRule.consecutiveLatePenaltyUnits ?? 0.5));
           row.halfDay = true;
           row.fullDay = false;
           lateStreak = 0;
@@ -865,7 +899,13 @@ async function buildReport({
         lateStreak = 0;
       }
 
-      if (date >= fromDate) rows.push(row);
+      if (date >= fromDate) {
+        if (includeAvatars) {
+          row.gender = ['male', 'female'].includes(employee.gender) ? employee.gender : null;
+          row.profilePhoto = employee.profilePhoto || '';
+        }
+        rows.push(row);
+      }
     }
     reportDiagnosticLog(reportId,
       `DONE employee ${employee.employeeId}: total=${Date.now() - employeeStartedAt}ms; shiftLookups=${shiftLookupCount}; shiftTotal=${shiftLookupMs}ms`);

@@ -5,7 +5,7 @@ const { restrictEmployeeFilter, assertEmployeeAllowed } = require('../services/a
 const {
   getEmployeeLeaveBalances,
   resolveLeaveType,
-  validateLeaveRequest
+  validateLeaveRequest, assertLeaveAvailable
 } = require('../services/leave.service');
 
 function normalizeStatus(leave) {
@@ -17,8 +17,15 @@ function normalizeDates(body) {
   const fromDate = body.fromDate || body.date;
   const toDate = body.toDate || body.fromDate || body.date;
   if (!fromDate || !toDate) throw new Error('date or fromDate/toDate is required');
-  const from = new Date(fromDate);
-  const to = new Date(toDate);
+  const parse = value=>{
+    if(typeof value==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(value)){
+      const d=new Date(value+'T00:00:00');
+      if(calendarKey(d)!==value)throw Error('Invalid leave date');return d;
+    }
+    return new Date(value);
+  };
+  const from = parse(fromDate);
+  const to = parse(toDate);
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) throw new Error('Invalid leave dates');
   if (to < from) throw new Error('toDate cannot be before fromDate');
   return { fromDate: from, toDate: to, date: from };
@@ -45,7 +52,10 @@ function policySnapshot(validation) {
     documentRequired: validation.documentRequired,
     documentRequiredAfterDays: validation.policy.documentRequiredAfterDays,
     excludedWeekends: validation.excludedWeekends,
-    excludedHolidays: validation.excludedHolidays
+    chargeableDates: validation.chargeableDates,
+    excludedHolidays: validation.excludedHolidays,
+    leavePolicyProfileId: validation.rule?.leavePolicyProfileId || null,
+    leaveTargetMinutes: validation.leaveTargetMinutes
   };
 }
 
@@ -82,6 +92,7 @@ async function create(req, res) {
       fromDate: dates.fromDate,
       toDate: dates.toDate,
       halfDay: Boolean(req.body.halfDay),
+      leaveMinutes: req.body.leaveMinutes ?? null,
       requestedStatus,
       documentSubmitted,
       isAdminGrant: isAdminGrant(req)
@@ -95,6 +106,7 @@ async function create(req, res) {
       fromDate: dates.fromDate,
       toDate: dates.toDate,
       days: validation.days,
+      leaveMinutes: validation.leaveMinutes, leaveTargetMinutes: validation.leaveTargetMinutes,
       status: validation.status,
       approved: validation.status === 'APPROVED',
       documentRequired: validation.documentRequired,
@@ -153,6 +165,7 @@ async function update(req, res) {
     });
     if ((req.body.leaveTypeId ?? existing.leaveTypeId) && !leaveType) throw new Error('Leave type not found');
 
+    if (Object.hasOwn(req.body,"leaveMinutes") && !isAdminGrant(req)) return res.status(403).json({success:false,message:"Only administrators may change hourly leave"});
     const halfDay = Boolean(req.body.halfDay ?? existing.halfDay);
     const documentUrl = String(req.body.documentUrl ?? existing.documentUrl ?? '');
     const documentSubmitted = Boolean(req.body.documentSubmitted ?? existing.documentSubmitted ?? documentUrl.trim());
@@ -162,6 +175,7 @@ async function update(req, res) {
       fromDate: dates.fromDate,
       toDate: dates.toDate,
       halfDay,
+      leaveMinutes: req.body.leaveMinutes ?? existing.leaveMinutes ?? null,
       requestedStatus: 'PENDING',
       excludeLeaveId: existing._id,
       documentSubmitted,
@@ -173,6 +187,7 @@ async function update(req, res) {
       fromDate: dates.fromDate,
       toDate: dates.toDate,
       days: validation.days,
+      leaveMinutes: validation.leaveMinutes, leaveTargetMinutes: validation.leaveTargetMinutes,
       leaveTypeId: leaveType?._id || req.body.leaveTypeId || existing.leaveTypeId || null,
       type: leaveType?.name || req.body.type || existing.type || 'Leave',
       reason: req.body.reason ?? existing.reason ?? '',
@@ -212,6 +227,9 @@ async function approve(req, res) {
     if (!(await assertEmployeeAllowed(req, existing.employeeId))) {
       return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
     }
+    if(normalizeStatus(existing)!=='PENDING')return res.status(409).json({success:false,message:'Only pending leave can be approved'});
+    const type=await resolveLeaveType(existing);
+    if(type)await assertLeaveAvailable(existing.employeeId,type,Number(existing.days), 'APPROVED',{excludeLeaveId:existing._id,fromDate:existing.fromDate||existing.date});
     if (existing.documentRequired && !existing.documentSubmitted && !String(existing.documentUrl || '').trim()) {
       return res.status(409).json({
         success: false,
@@ -220,12 +238,13 @@ async function approve(req, res) {
       });
     }
 
-    const leave = await Leave.findByIdAndUpdate(
-      req.params.id,
+    const leave = await Leave.findOneAndUpdate(
+      {_id:req.params.id,status:'PENDING'},
       { $set: { status: 'APPROVED', approved: true, managerRemarks: req.body.managerRemarks || '' } },
       { new: true, runValidators: true }
     ).lean();
 
+    if(!leave)return res.status(409).json({success:false,message:'Leave status changed; refresh and retry'});
     try {
       await notifyEmployee(
         leave.employeeId,
@@ -329,4 +348,26 @@ async function balances(req, res) {
   }
 }
 
-module.exports = { list, create, update, approve, reject, remove, calendar, balances };
+async function recurring(req,res){
+ try{
+  const employeeId=String(req.body.employeeId||'');
+  if(!await assertEmployeeAllowed(req,employeeId))return res.sendStatus(403);
+  const dates=require('../services/recurring-leave.service').recurringDates(req.body);
+  const reason=typeof req.body.reason==='string'?req.body.reason.trim():'';
+  if(!reason||reason.length>1000)throw Error('Reason required');
+  const type=await resolveLeaveType(req.body);if(!type||type.active===false)throw Error('Select an active leave type');
+  const results=[];
+  for(const day of dates){
+    try{
+      const date=new Date(day+'T00:00:00');
+      const validation=await validateLeaveRequest({employeeId,leaveType:type,fromDate:date,toDate:date,halfDay:Boolean(req.body.halfDay),leaveMinutes:req.body.leaveMinutes??null,requestedStatus:'APPROVED',isAdminGrant:true});
+      const leave=await Leave.create({employeeId,leaveTypeId:type._id,type:type.name,date,fromDate:date,toDate:date,days:validation.days,reason,halfDay:Boolean(req.body.halfDay),halfDayPeriod:req.body.halfDay?'FIRST':'',leaveMinutes:validation.leaveMinutes,leaveTargetMinutes:validation.leaveTargetMinutes,status:validation.status,approved:validation.status==='APPROVED',documentRequired:validation.documentRequired,policySnapshot:policySnapshot(validation)});
+      results.push({date:day,success:true,id:String(leave._id),status:validation.status});
+    }catch(e){results.push({date:day,success:false,code:e.code||'LEAVE_CREATE_FAILED',message:e.message});}
+  }
+  const created=results.filter(r=>r.success).length;
+  await require('../middleware/auth').audit(req,'employee.leave.recurring',{targetId:employeeId,created,requested:dates.length});
+  res.json({success:created===dates.length,created,requested:dates.length,results});
+ }catch(e){res.status(400).json({success:false,message:e.message});}
+}
+module.exports = { list, create, update, approve, reject, remove, calendar, balances, recurring };

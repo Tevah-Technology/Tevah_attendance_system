@@ -1,0 +1,15 @@
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const {validZone,localKey,localInstant,labelDate,employeeLabel,groupPunches}=require('../src/utils/employee-time');
+const {validateOverrides,effectiveRule}=require('../src/services/employee-rule.service');
+const {makeDaySummary}=require('../src/services/report.service');
+const shift={shiftType:'WORKING_HOURS_ONLY',requiredMinutes:480,enableOvertime:true,workingDays:[1,2,3,4,5,6,7]};
+const employee={employeeId:'T1',timezone:'Pacific/Honolulu'};
+const p=(type,time)=>({punchType:type,timestamp:new Date(time)});
+test('valid IANA zones and employee local calendar day',()=>{assert.equal(validZone('Pacific/Honolulu'),true);assert.equal(validZone('Made/Up'),false);assert.equal(localKey('2026-11-27T05:00:00Z','Pacific/Honolulu'),'2026-11-26');});
+test('New York summer and winter offsets',()=>{assert.equal(localInstant('2026-07-01','09:00','America/New_York').toISOString(),'2026-07-01T13:00:00.000Z');assert.equal(localInstant('2026-11-26','09:00','America/New_York').toISOString(),'2026-11-26T14:00:00.000Z');});
+test('DST transition gap and repeated clock time resolve deterministically',()=>{assert.equal(localInstant('2026-03-08','02:30','America/New_York').toISOString(),'2026-03-08T07:30:00.000Z');assert.equal(localInstant('2026-11-01','01:30','America/New_York').toISOString(),'2026-11-01T05:30:00.000Z');});
+test('flexible overnight session belongs only to local start date',()=>{const punches=[p('IN','2026-11-27T08:00:00Z'),p('OUT','2026-11-27T16:00:00Z')];const map=groupPunches(punches,employee,()=>({shift}));assert.equal(map.size,1);const day=labelDate('2026-11-26');const row=makeDaySummary(day,map.get(day.toISOString()),employee,shift,null,{});assert.equal(row.workedMinutes,480);assert.equal(row.overtimeMinutes,0);assert.equal(row.lateMinutes,0);});
+test('subsequent session goes to its own local day',()=>{const map=groupPunches([p('IN','2026-11-27T08:00:00Z'),p('OUT','2026-11-27T16:00:00Z'),p('IN','2026-11-27T18:00:00Z'),p('OUT','2026-11-27T20:00:00Z')],employee,()=>({shift}));assert.equal(map.size,2);assert.equal(map.get(labelDate('2026-11-27').toISOString()).length,2);});
+test('profile validation accepts typed overrides and rejects unknown/security fields',()=>{assert.deepEqual(validateOverrides({overtimeEnabled:false,halfDayMinutes:180}),{overtimeEnabled:false,halfDayMinutes:180});assert.throws(()=>validateOverrides({geofenceEnabled:false}));assert.throws(()=>validateOverrides({overtimeEnabled:'false'}));});
+test('individual overrides take precedence over company defaults',async()=>{const r=await effectiveRule({ruleOverrides:{overtimeEnabled:false}}, {overtimeEnabled:true,autoCheckoutEnabled:true});assert.equal(r.overtimeEnabled,false);assert.equal(r.autoCheckoutEnabled,true);});

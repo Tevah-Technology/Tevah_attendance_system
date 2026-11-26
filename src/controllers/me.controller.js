@@ -11,9 +11,13 @@ async function profile(req, res) {
 }
 async function updateProfile(req, res) {
   if (!req.user.employeeId) return res.status(404).json({ success: false, message: 'No employee profile is linked to this account' });
-  const allowed = ['phone', 'email'];
+  const allowed = ['phone', 'email', 'gender', 'profilePhoto'];
+  const { validProfilePhoto, validAvatarGender } = require('../utils/profile-photo');
+  const body = req.body || {};
+  if (Object.hasOwn(body, 'gender') && !validAvatarGender(body.gender)) return res.status(400).json({success:false,message:'Invalid avatar selection'});
+  if (Object.hasOwn(body, 'profilePhoto') && !validProfilePhoto(body.profilePhoto)) return res.status(400).json({success:false,message:'Invalid profile photo (PNG/JPEG/WebP, maximum 128 KB)'});
   const update = {};
-  for (const key of allowed) if (req.body[key] != null) update[key] = req.body[key];
+  for (const key of allowed) if (body[key] != null) update[key] = body[key];
   const employee = await Employee.findOneAndUpdate({ employeeId: req.user.employeeId }, { $set: update }, { new: true, runValidators: true }).lean();
   if (!employee) return res.status(404).json({ success: false, message: 'Employee profile not found' });
   res.json({ success: true, employee });

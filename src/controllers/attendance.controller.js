@@ -1,3 +1,4 @@
+const { canSelectAttendanceDate, allowDates, todayBounds } = require('../utils/attendance-access');
 const { Attendance } = require('../models');
 const attendanceService = require('../services/attendance.service');
 const { startOfDay, endOfDay } = require('../utils/time');
@@ -43,6 +44,15 @@ async function list(req, res) {
       if (req.query.to) {
         filter.timestamp.$lte = new Date(req.query.to);
       }
+    }
+
+    if (!canSelectAttendanceDate(req.access)) {
+      const dates = [req.query.from, req.query.to].filter(value => value !== undefined);
+      if (!allowDates(req, res, dates)) return;
+      const bounds = todayBounds();
+      const requested = filter.timestamp || {};
+      filter.timestamp = { $gte: requested.$gte && requested.$gte > bounds.$gte ? requested.$gte : bounds.$gte, $lt: bounds.$lt };
+      if (requested.$lte) filter.timestamp.$lte = requested.$lte;
     }
 
     // Apply employee access scope.
@@ -106,6 +116,7 @@ async function list(req, res) {
 async function latest(req, res) {
   try {
     let filter = {};
+    if (!canSelectAttendanceDate(req.access)) filter.timestamp = todayBounds();
 
     filter = await restrictEmployeeFilter(
       req,
@@ -183,6 +194,7 @@ async function stream(req, res) {
       res,
       allowedEmployeeIds: ids,
       roleCode: req.access?.roleCode,
+      canSelectAttendanceDate: canSelectAttendanceDate(req.access),
     };
 
     req.app.locals.sseClients.add(
@@ -355,21 +367,9 @@ async function employeeDay(req, res) {
     // by the synchronization process.
     //
 
-    const employeeDoc = await require('../models').Employee.findOne({ employeeId }).lean();
-    const identityFilters = [{ employeeId }];
-    if (employeeDoc?.deviceUserId) identityFilters.push({ userId: String(employeeDoc.deviceUserId) });
-    if (employeeDoc?.deviceUid != null) identityFilters.push({ userId: String(employeeDoc.deviceUid) });
-
-    const punches =
-      await Attendance.find({
-        $or: identityFilters,
-        timestamp: {
-          $gte: start,
-          $lte: end,
-        },
-      })
-        .sort({ timestamp: 1 })
-        .lean();
+    // Reuse the report's actual punch grouping so overnight OUT events are
+    // visible on their attributed attendance date, not a second calendar day.
+    const punches=record?.punches || [];
 
     // --------------------------------------------------------
     // ATTENDANCE CALCULATED SUMMARY
@@ -649,141 +649,33 @@ async function compensateLate(req, res) {
 // UPDATE ATTENDANCE
 // ============================================================
 
-async function update(req, res) {
-  try {
-    const existing =
-      await Attendance.findById(
-        req.params.id
-      )
-        .select('employeeId')
-        .lean();
-
-    if (!existing) {
-      return res.status(404).json({
-        success: false,
-        message:
-          'Attendance record not found',
-      });
-    }
-
-    // --------------------------------------------------------
-    // SECURITY
-    // --------------------------------------------------------
-
-    if (
-      !(await assertEmployeeAllowed(
-        req,
-        existing.employeeId
-      ))
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Attendance is outside your assigned data scope',
-        code: 'SCOPE_FORBIDDEN',
-      });
-    }
-
-    if (
-      req.body.employeeId &&
-      !(await assertEmployeeAllowed(
-        req,
-        req.body.employeeId
-      ))
-    ) {
-      return res.status(403).json({
-        success: false,
-        message:
-          'Target employee is outside your assigned data scope',
-        code: 'SCOPE_FORBIDDEN',
-      });
-    }
-
-    // --------------------------------------------------------
-    // ALLOWED FIELDS
-    // --------------------------------------------------------
-
-    const allowed = [
-      'timestamp',
-      'punchType',
-      'employeeId',
-      'employeeName',
-      'userId',
-      'state',
-    ];
-
-    const changes = {};
-
-    for (const key of allowed) {
-      if (
-        req.body[key] !== undefined
-      ) {
-        changes[key] =
-          req.body[key];
-      }
-    }
-
-    if (req.body.timestamp) {
-      changes.timestamp =
-        new Date(
-          req.body.timestamp
-        );
-    }
-
-    if (
-      req.body.correctionReason
-    ) {
-      changes.correctionReason =
-        String(
-          req.body.correctionReason
-        );
-    }
-
-    // --------------------------------------------------------
-    // AUDIT
-    // --------------------------------------------------------
-
-    changes.source =
-      'MANUAL_ADMIN';
-
-    changes.correctedAt =
-      new Date();
-
-    // --------------------------------------------------------
-    // UPDATE
-    // --------------------------------------------------------
-
-    const record =
-      await Attendance.findByIdAndUpdate(
-        req.params.id,
-        {
-          $set: changes,
-        },
-        {
-          new: true,
-          runValidators: true,
-        }
-      ).lean();
-
-    return res.json({
-      success: true,
-      message:
-        'Attendance record updated',
-      data: record,
-    });
-  } catch (error) {
-    console.error(
-      'Attendance update error:',
-      error
-    );
-
-    return res.status(400).json({
-      success: false,
-      message: error.message,
-    });
-  }
+async function update(req,res) {
+ try {
+  const existing=await Attendance.findById(req.params.id);
+  if(!existing)return res.status(404).json({success:false,message:'Attendance record not found'});
+  if(!(await assertEmployeeAllowed(req,existing.employeeId)))return res.status(403).json({success:false,message:'Attendance outside your data scope'});
+  const timestamp=new Date(req.body.timestamp);
+  const reason=String(req.body.correctionReason||'').trim();
+  if(!req.body.timestamp || Number.isNaN(timestamp.getTime()) || reason.length<8)return res.status(400).json({success:false,message:'Valid timestamp and correction reason (8+ characters) required'});
+  if(!allowDates(req,res,[existing.timestamp,timestamp]))return;
+  if(timestamp.getTime()===existing.timestamp.getTime())return res.status(400).json({success:false,message:'New timestamp is unchanged'});
+  // No arbitrary employee reassignment or punch-type changes through corrections.
+  const before=existing.timestamp;
+  const actorId=String(req.user?._id||req.user?.id||req.user?.email||'unknown');
+  const entry={oldTimestamp:before,newTimestamp:timestamp,reason,actorId,at:new Date()};
+  const {createNotice}=require('../services/attendance-adjustment-notify');
+  const {AuditLog}=require('../models');
+  const updated=await Attendance.findOneAndUpdate({_id:existing._id,timestamp:before},{
+   $set:{timestamp,correctionReason:reason,correctedAt:entry.at,
+     originalTimestamp:existing.originalTimestamp||before,originalSource:existing.originalSource||existing.source},
+   $push:{correctionHistory:entry}
+  },{new:true,runValidators:true}).lean();
+  if(!updated)return res.status(409).json({success:false,message:'Attendance changed during correction; refresh and retry'});
+  await AuditLog.create({actorId,actorEmail:String(req.user?.email||''),action:'ATTENDANCE_TIME_CORRECTED',method:req.method,path:req.originalUrl,targetId:String(existing._id),metadata:{employeeId:existing.employeeId,...entry}});
+  await createNotice(existing.employeeId,'TIME_CORRECTION','Attendance time corrected',`Attendance was corrected from ${before.toISOString()} to ${timestamp.toISOString()}. Reason: ${reason}`,{attendanceId:String(existing._id),oldTimestamp:before,newTimestamp:timestamp});
+  return res.json({success:true,message:'Attendance corrected',data:updated});
+ }catch(error){console.error('Attendance correction failed',error);return res.status(400).json({success:false,message:error.message});}
 }
-
 
 
 // ============================================================
@@ -822,7 +714,7 @@ async function selfCheckIn(req, res) {
       });
     }
 
-    const locationRule = await attendanceService.getRule();
+    const locationRule = await attendanceService.getRule(employeeId);
     const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'in');
     const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckIn(employeeId, {
@@ -862,7 +754,7 @@ async function selfCheckOut(req, res) {
       });
     }
 
-    const locationRule = await attendanceService.getRule();
+    const locationRule = await attendanceService.getRule(employeeId);
     const {location: validatedLocation, geofence} = require('../utils/geofence').validateForAttendance(req.body, locationRule, 'out');
     const location = await require('../utils/reverse-geocode').enrichWebLocation(validatedLocation);
     const result = await attendanceService.webCheckOut(employeeId, {

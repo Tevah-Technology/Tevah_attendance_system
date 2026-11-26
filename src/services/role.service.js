@@ -1,6 +1,8 @@
 const { Role, AdminUser } = require('../models');
 const { DEFAULT_ROLES, normalizePermissions, ROLE_TEMPLATES } = require('../config/permissions');
 
+const { INDEPENDENT_PERMISSIONS } = require('../utils/attendance-access');
+
 async function ensureDefaultRoles() {
   for (const definition of DEFAULT_ROLES) {
     await Role.updateOne(
@@ -22,9 +24,11 @@ async function ensureDefaultRoles() {
 
     // Add newly introduced permissions to existing system roles without
     // replacing any custom permissions already stored on the role.
+    // Independent attendance permissions are deliberately excluded from this
+    // recurring grant so an administrator’s explicit revocation survives restart.
     await Role.updateOne(
       { code: definition.code, system: true },
-      { $addToSet: { permissions: { $each: definition.permissions } } }
+      { $addToSet: { permissions: { $each: definition.permissions.filter(key => !INDEPENDENT_PERMISSIONS.includes(key)) } } }
     );
   }
 

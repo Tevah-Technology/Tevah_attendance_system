@@ -54,4 +54,26 @@ function effectiveLeavePolicy(rule, leaveType = null) {
   };
 }
 
-module.exports = { DEFAULTS, getLeaveRule, effectiveLeavePolicy };
+// Store full, validated profiles so later company default changes do not change a profile.
+function validateProfileRules(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('Rules must be an object');
+  const output = {};
+  for (const [k,v] of Object.entries(input)) {
+    if (k === 'key' || !Object.hasOwn(DEFAULTS,k)) throw Error(`Unsupported rule: ${k}`);
+    const sample = DEFAULTS[k];
+    if (typeof sample === 'boolean' && typeof v !== 'boolean') throw Error(`${k} must be boolean`);
+    if (typeof sample === 'number' && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 10000)) throw Error(`Invalid ${k}`);
+    if (Array.isArray(sample) && (!Array.isArray(v) || v.length > 100 || v.some(x=>typeof x!=='string'||!x.trim()||x.length>50))) throw Error(`Invalid ${k}`);
+    output[k] = Array.isArray(sample) ? [...new Set(v.map(x=>x.trim().toUpperCase()))] : v;
+  }
+  return output;
+}
+async function employeeLeaveRule(employeeId, year, base) {
+  base = base || await getLeaveRule();
+  const assignment=await require('../models/EmployeeLeavePolicy').findOne({employeeId:String(employeeId),year:Number(year)}).lean();
+  if (!assignment?.profileId) return base;
+  const profile=await require('../models/LeavePolicyProfile').findById(assignment.profileId).lean();
+  if (!profile) throw Error('Assigned leave policy profile not found');
+  return {...base,...validateProfileRules(profile.rules),leavePolicyProfileId:String(profile._id)};
+}
+module.exports = { DEFAULTS, getLeaveRule, effectiveLeavePolicy, validateProfileRules, employeeLeaveRule };

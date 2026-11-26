@@ -1,6 +1,8 @@
 const {
   Shift,
   ShiftAssignment,
+  Employee,
+  Rule,
 } = require('../models');
 
 const {
@@ -304,6 +306,16 @@ function normalizeShiftBody(body = {}) {
 // ============================================================
 
 function validate(body = {}) {
+  try { Object.assign(body, require('../services/shift-schedule.service').validateSchedule(body)); } catch(e) { return e.message; }
+  if (!['FIXED', 'WORKING_HOURS_ONLY'].includes(body.shiftType || 'FIXED')) return 'Invalid shiftType';
+  if (body.maximumSessionMinutes !== undefined && (!Number.isInteger(body.maximumSessionMinutes) || body.maximumSessionMinutes < 0 || body.maximumSessionMinutes > 1440)) return 'maximumSessionMinutes must be an integer from 0 to 1440';
+  if (body.shiftType === 'WORKING_HOURS_ONLY') {
+    if (!Number.isInteger(body.requiredMinutes) || body.requiredMinutes < 1 || body.requiredMinutes > 1440) return 'requiredMinutes must be an integer from 1 to 1440';
+    for (const key of ['startTime','endTime','lunchStartTime','lunchEndTime','overtimeStartTime']) body[key] = '';
+    body.isOvernight = false;
+    body.breakMinutes = body.breakDurationMinutes = 0;
+    body.overtimeAfterMinutes = body.requiredMinutes;
+  } else if (!isValidTime(body.startTime) || !isValidTime(body.endTime)) return 'Fixed shifts require startTime and endTime in HH:mm';
   for (const key of ['lunchStartTime', 'lunchEndTime']) {
     if (body[key] !== undefined && body[key] !== '' && !isValidTime(body[key]))
       return `${key} must be HH:mm`;
@@ -315,14 +327,14 @@ function validate(body = {}) {
   }
 
   if (
-    body.startTime !== undefined &&
+    body.shiftType !== 'WORKING_HOURS_ONLY' && body.startTime !== undefined &&
     !isValidTime(body.startTime)
   ) {
     return 'startTime must be HH:mm';
   }
 
   if (
-    body.endTime !== undefined &&
+    body.shiftType !== 'WORKING_HOURS_ONLY' && body.endTime !== undefined &&
     !isValidTime(body.endTime)
   ) {
     return 'endTime must be HH:mm';
@@ -565,20 +577,14 @@ async function list(req, res) {
         },
       ]);
 
-    const countMap =
-      new Map(
-        counts.map(
-          (row) => [
-            String(row._id),
-
-            Array.isArray(
-              row.employees
-            )
-              ? row.employees.length
-              : 0,
-          ]
-        )
-      );
+    const employeeSets = new Map(counts.map(row => [String(row._id), new Set(row.employees || [])]));
+    const defaults = await Employee.find({ shiftId: { $ne: null } }).select('employeeId shiftId').lean();
+    for (const employee of defaults) {
+      const key = String(employee.shiftId);
+      if (!employeeSets.has(key)) employeeSets.set(key, new Set());
+      employeeSets.get(key).add(employee.employeeId);
+    }
+    const countMap = new Map([...employeeSets].map(([key, ids]) => [key, ids.size]));
 
     const normalizedShifts =
       shifts.map(
@@ -727,52 +733,15 @@ async function update(req, res) {
     req.params.id
   );
 
-  const payload =
-    normalizeShiftBody(
-      req.body
-    );
-
-  const error =
-    validate(payload);
-
-  if (error) {
-
-    return res
-      .status(400)
-      .json({
-        success: false,
-        message: error,
-      });
-  }
-
   try {
-
-    const shift =
-      await Shift.findByIdAndUpdate(
-        req.params.id,
-
-        {
-          $set:
-            payload,
-        },
-
-        {
-          new: true,
-          runValidators: true,
-        }
-      );
-
-    if (!shift) {
-
-      return res
-        .status(404)
-        .json({
-          success: false,
-
-          message:
-            'Shift not found',
-        });
-    }
+    const shift = await Shift.findById(req.params.id);
+    if (!shift) return res.status(404).json({success:false,message:'Shift not found'});
+    const payload = { ...shift.toObject(), ...normalizeShiftBody(req.body) };
+    const error = validate(payload);
+    if (error) return res.status(400).json({success:false,message:error});
+    delete payload._id; delete payload.__v; delete payload.createdAt; delete payload.updatedAt;
+    shift.set(payload);
+    await shift.save();
 
     const assignmentCount =
       await ShiftAssignment
@@ -788,13 +757,14 @@ async function update(req, res) {
           }
         );
 
+    const permanentIds = await Employee.distinct('employeeId', { shiftId: shift._id });
     const response = {
       success: true,
 
       shift:
         normalizeShiftForResponse(
           shift,
-          assignmentCount.length
+          new Set([...assignmentCount, ...permanentIds]).size
         ),
     };
 
@@ -860,7 +830,7 @@ async function remove(req, res) {
       });
 
     if (
-      assignmentCount > 0
+      assignmentCount > 0 || await Employee.exists({ shiftId: req.params.id }) || await Rule.exists({ defaultShiftId: req.params.id })
     ) {
 
       return res

@@ -19,6 +19,7 @@ const fakeModels = {
   Employee: { find: () => makeQuery([{employeeId: 'EMP007', active: true}]) },
   Attendance: { find: () => makeQuery([]) },
   Leave: {find: () => makeQuery([])},
+  AttendanceAdjustment: {find: () => makeQuery([])},
   Compensation: {find: (query) => {
     compensationQuery = query;
     const f = query.$or[0].date;

@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { validProfilePhoto, validAvatarGender } = require('../utils/profile-photo');
 
 const employeeSchema = new mongoose.Schema(
   {
@@ -40,6 +41,19 @@ const employeeSchema = new mongoose.Schema(
     email: {
       type: String,
       default: ''
+    },
+
+    gender: {
+      type: String,
+      enum: ['male', 'female'],
+      // Missing gender is an unset preference, not a third option.
+      validate: validAvatarGender
+    },
+
+    profilePhoto: {
+      type: String,
+      default: '',
+      validate: { validator: validProfilePhoto, message: 'Invalid profile photo (PNG/JPEG/WebP, maximum 128 KB)' }
     },
 
     // Employment dates used by leave-policy validation.
@@ -109,6 +123,11 @@ const employeeSchema = new mongoose.Schema(
     // ========================================================
     // SHIFT
     // ========================================================
+
+    timezone: { type: String, default: null, validate: v => v == null || require('../utils/employee-time').validZone(v) },
+    ruleProfileId: { type: mongoose.Schema.Types.ObjectId, ref: 'AttendanceRuleProfile', default: null },
+    holidayCalendarAssignments: {type:[new mongoose.Schema({year:Number,profileId:{type:mongoose.Schema.Types.ObjectId,ref:'HolidayCalendarProfile',default:null},mode:{type:String,enum:['company','custom','both','none']},reason:String},{_id:false})],default:[]},
+    ruleOverrides: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
 
     shiftId: {
       type: mongoose.Schema.Types.ObjectId,
