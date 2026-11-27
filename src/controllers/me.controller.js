@@ -1,3 +1,4 @@
+const { withAttendanceDisplay, decoratePunches } = require('../utils/attendance-time-display');
 const { Employee, Attendance, Leave } = require('../models');
 const { getTodayStatus } = require('../services/attendance.service');
 const { buildReport } = require('../services/report.service');
@@ -27,7 +28,7 @@ async function attendance(req, res) {
   const to = req.query.to ? new Date(req.query.to) : new Date();
   const rows = await Attendance.find({ employeeId: req.user.employeeId, timestamp: { $gte: from, $lte: to } }).sort({ timestamp: 1 }).lean();
   const status = await getTodayStatus(req.user.employeeId);
-  res.json({ success: true, count: rows.length, data: rows, todayStatus: status });
+  res.json({ success: true, count: rows.length, data: await decoratePunches(rows, Employee), todayStatus: status });
 }
 
 // Employee-scoped daily attendance summary. Unlike /me/attendance, this endpoint
@@ -52,7 +53,8 @@ async function attendanceDaily(req, res) {
       return res.status(400).json({ success: false, message: 'Invalid attendance date range (maximum 370 days)' });
     }
     const rows = await buildReport({ from, to, employeeId, employeeIds: [employeeId] });
-    const data = rows.filter(row => String(row.employeeId) === employeeId).map(row => ({
+    const data = rows.filter(row => String(row.employeeId) === employeeId).map(row => withAttendanceDisplay({
+      timezone: row.timezone,
       date: row.date,
       employeeId,
       firstIn: row.firstIn,

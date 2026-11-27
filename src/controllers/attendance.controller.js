@@ -1,5 +1,6 @@
 const { canSelectAttendanceDate, allowDates, todayBounds } = require('../utils/attendance-access');
-const { Attendance } = require('../models');
+const { Attendance, Employee } = require('../models');
+const { decoratePunches, withAttendanceDisplay } = require('../utils/attendance-time-display');
 const attendanceService = require('../services/attendance.service');
 const { startOfDay, endOfDay } = require('../utils/time');
 
@@ -93,7 +94,7 @@ async function list(req, res) {
       page,
       limit,
       total,
-      data,
+      data: await decoratePunches(data, Employee),
     });
   } catch (error) {
     console.error(
@@ -139,7 +140,7 @@ async function latest(req, res) {
 
     res.json({
       success: true,
-      data,
+      data: await decoratePunches(data, Employee),
     });
   } catch (error) {
     console.error(
@@ -383,12 +384,10 @@ async function employeeDay(req, res) {
 
           firstIn:
             record.firstIn ||
-            record.firstPunch ||
             null,
 
           lastOut:
             record.lastOut ||
-            record.lastPunch ||
             null,
 
           workingMinutes:
@@ -504,10 +503,9 @@ async function employeeDay(req, res) {
 
       employeeId,
 
-      attendance,
+      attendance: withAttendanceDisplay(attendance, record?.timezone),
 
-      punches:
-        normalizedPunches,
+      punches: withAttendanceDisplay({ punches: normalizedPunches }, record?.timezone).punches,
 
       /*
        * Keep original report data.
