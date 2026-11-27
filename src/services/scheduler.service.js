@@ -13,6 +13,7 @@ let checkoutTimer = null;
 let syncInProgress = false;
 let checkoutInProgress = false;
 let consecutiveSyncFailures = 0;
+let lastAbsenceRun = 0;
 
 const ms = (key, fallback, minimum = 10000) => {
   const value = Number(process.env[key]);
@@ -42,6 +43,10 @@ async function runDeviceCycle() {
     const result = await syncAttendance();
     console.log('[F28] Attendance sync:', result);
     consecutiveSyncFailures = 0;
+    if (process.env.ABSENCE_DEDUCTION_ENABLED === "true" && result.failed === 0 && result.skipped === 0 && Date.now()-lastAbsenceRun >= 3600000) {
+      lastAbsenceRun = Date.now();
+      require("./absence-deduction.service").reconcile({apply:true}).then(changes=>console.log("[Absence deductions] changes:",changes.length)).catch(e=>console.error("[Absence deductions]",e.message));
+    }
 
     if (!realtimeDevice && String(process.env.ZK_REALTIME).toLowerCase() === 'true') {
       try {

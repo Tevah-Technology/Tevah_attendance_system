@@ -99,6 +99,7 @@ async function initializeApplication() {
         await connectDatabase();
 
         await ensureBootstrapAdmin();
+        require('./src/services/realtime.service').start();
 
         return true;
       })()

@@ -1,4 +1,4 @@
-const { Leave, Employee } = require('../models');
+const { Leave, Employee, EmployeeNotification } = require('../models');
 const { listActiveHolidays, employeeHolidayEligible, holidayOccursOn, calendarKey } = require('../services/holiday.service');
 const { notifyEmployee } = require('../services/notification.service');
 const { restrictEmployeeFilter, assertEmployeeAllowed } = require('../services/access-scope.service');
@@ -85,6 +85,8 @@ async function create(req, res) {
     if (req.body.leaveTypeId && !leaveType) throw new Error('Leave type not found');
 
     const requestedStatus = String(req.body.status || 'PENDING').toUpperCase();
+    const officeGrant = isAdminGrant(req) && requestedStatus === 'APPROVED' && (String(req.user?.employeeId||'') !== String(req.body.employeeId));
+    const deductBalance = !officeGrant;
     const documentSubmitted = Boolean(req.body.documentSubmitted || String(req.body.documentUrl || '').trim());
     const validation = await validateLeaveRequest({
       employeeId: req.body.employeeId,
@@ -95,11 +97,12 @@ async function create(req, res) {
       leaveMinutes: req.body.leaveMinutes ?? null,
       requestedStatus,
       documentSubmitted,
-      isAdminGrant: isAdminGrant(req)
+      isAdminGrant: isAdminGrant(req), deductBalance
     });
 
     const leave = await Leave.create({
       ...req.body,
+      deductBalance,
       leaveTypeId: leaveType?._id || req.body.leaveTypeId || null,
       type: leaveType?.name || req.body.type || 'Leave',
       date: dates.date,
@@ -121,7 +124,7 @@ async function create(req, res) {
       success: true,
       leave: { ...leave.toObject(), status: validation.status },
       policy: {
-        chargedDays: validation.days,
+        chargedDays: deductBalance ? validation.days : 0,
         excludedWeekends: validation.excludedWeekends,
         excludedHolidays: validation.excludedHolidays,
         documentRequired: validation.documentRequired,
@@ -179,7 +182,7 @@ async function update(req, res) {
       requestedStatus: 'PENDING',
       excludeLeaveId: existing._id,
       documentSubmitted,
-      isAdminGrant: false
+      isAdminGrant: false, deductBalance: existing.deductBalance !== false
     });
 
     const patch = {
@@ -229,7 +232,7 @@ async function approve(req, res) {
     }
     if(normalizeStatus(existing)!=='PENDING')return res.status(409).json({success:false,message:'Only pending leave can be approved'});
     const type=await resolveLeaveType(existing);
-    if(type)await assertLeaveAvailable(existing.employeeId,type,Number(existing.days), 'APPROVED',{excludeLeaveId:existing._id,fromDate:existing.fromDate||existing.date});
+    if(type && existing.deductBalance !== false)await assertLeaveAvailable(existing.employeeId,type,Number(existing.days), 'APPROVED',{excludeLeaveId:existing._id,fromDate:existing.fromDate||existing.date});
     if (existing.documentRequired && !existing.documentSubmitted && !String(existing.documentUrl || '').trim()) {
       return res.status(409).json({
         success: false,
@@ -245,6 +248,9 @@ async function approve(req, res) {
     ).lean();
 
     if(!leave)return res.status(409).json({success:false,message:'Leave status changed; refresh and retry'});
+    try {
+      await EmployeeNotification.create({employeeId: leave.employeeId, kind:'leaveDecision', title:'Leave request approved', message:'Your leave request has been approved.', metadata:{leaveId:String(leave._id)}});
+    } catch (error) { console.error('In-app leave notice failed:', error.message); }
     try {
       await notifyEmployee(
         leave.employeeId,
@@ -274,6 +280,9 @@ async function reject(req, res) {
       { new: true, runValidators: true }
     ).lean();
     try {
+      await EmployeeNotification.create({employeeId: leave.employeeId, kind:'leaveDecision', title:'Leave request rejected', message:`Your leave request was rejected. Reason: ${reason}`, metadata:{leaveId:String(leave._id)}});
+    } catch (error) { console.error('In-app leave notice failed:', error.message); }
+    try {
       await notifyEmployee(leave.employeeId, 'leaveDecision', 'Leave request rejected', `Your leave request was rejected. Reason: ${reason}`);
     } catch (notifyError) {
       console.error('Leave rejection notification failed:', notifyError.message);
@@ -290,6 +299,7 @@ async function remove(req, res) {
     if (!existing) return res.status(404).json({ success: false, message: 'Leave request not found' });
     if (!(await assertEmployeeAllowed(req, existing.employeeId))) return res.status(403).json({ success: false, message: 'Leave is outside your assigned data scope', code: 'SCOPE_FORBIDDEN' });
     const result = await Leave.findByIdAndDelete(req.params.id);
+    if (result) require('../services/realtime.service').publish('leave', existing.employeeId);
     res.json({ success: true, deleted: Boolean(result) });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });
@@ -360,8 +370,8 @@ async function recurring(req,res){
   for(const day of dates){
     try{
       const date=new Date(day+'T00:00:00');
-      const validation=await validateLeaveRequest({employeeId,leaveType:type,fromDate:date,toDate:date,halfDay:Boolean(req.body.halfDay),leaveMinutes:req.body.leaveMinutes??null,requestedStatus:'APPROVED',isAdminGrant:true});
-      const leave=await Leave.create({employeeId,leaveTypeId:type._id,type:type.name,date,fromDate:date,toDate:date,days:validation.days,reason,halfDay:Boolean(req.body.halfDay),halfDayPeriod:req.body.halfDay?'FIRST':'',leaveMinutes:validation.leaveMinutes,leaveTargetMinutes:validation.leaveTargetMinutes,status:validation.status,approved:validation.status==='APPROVED',documentRequired:validation.documentRequired,policySnapshot:policySnapshot(validation)});
+      const validation=await validateLeaveRequest({employeeId,leaveType:type,fromDate:date,toDate:date,halfDay:Boolean(req.body.halfDay),leaveMinutes:req.body.leaveMinutes??null,requestedStatus:'APPROVED',isAdminGrant:true,deductBalance:false});
+      const leave=await Leave.create({employeeId,deductBalance:false,leaveTypeId:type._id,type:type.name,date,fromDate:date,toDate:date,days:validation.days,reason,halfDay:Boolean(req.body.halfDay),halfDayPeriod:req.body.halfDay?'FIRST':'',leaveMinutes:validation.leaveMinutes,leaveTargetMinutes:validation.leaveTargetMinutes,status:validation.status,approved:validation.status==='APPROVED',documentRequired:validation.documentRequired,policySnapshot:policySnapshot(validation)});
       results.push({date:day,success:true,id:String(leave._id),status:validation.status});
     }catch(e){results.push({date:day,success:false,code:e.code||'LEAVE_CREATE_FAILED',message:e.message});}
   }

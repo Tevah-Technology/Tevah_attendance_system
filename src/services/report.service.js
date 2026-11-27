@@ -435,6 +435,7 @@ function makeDaySummary(
       employee.designation || '',
 
     status,
+    scheduledWorkingDay: dayException?.working ?? workingDays.includes(dayOfWeek),
     holiday: holiday ? { id: holiday._id, name: holiday.name, type: holiday.type } : null,
     leave: leave ? { id: leave._id, type: leave.type, halfDay: Boolean(leave.halfDay), minutes:partialLeaveMinutes||null, days:leave.days } : null,
 

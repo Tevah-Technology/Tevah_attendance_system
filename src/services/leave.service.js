@@ -38,6 +38,7 @@ async function resolveLeaveType({ leaveTypeId, type } = {}) {
 }
 
 function leaveDays(leave) {
+  if (leave.deductBalance === false) return 0;
   const n = Number(leave.days);
   return Number.isFinite(n) && n > 0 ? n : 1;
 }
@@ -82,7 +83,7 @@ async function calculateChargeableDays(fromDate, toDate, policy, { halfDay = fal
     const shift=resolveShift?.(cursor)?.shift;
     const day = require('./shift-schedule.service').resolveShiftSchedule(shift,exceptions,exactKey,Number(shift?.requiredMinutes??attendanceRule.fullDayMinutes??480),originalHoliday?{name:'Holiday'}:null);
     const holiday = Boolean(day.holiday);
-    const normallyOff=Array.isArray(shift?.workingDays)?!shift.workingDays.includes(cursor.getDay()||7):isWeekend(cursor);
+    const normallyOff=Array.isArray(shift?.workingDays)?!shift.workingDays.includes(cursor.getDay()||7):cursor.getDay()===0;
     const weekend = day.holidayException?.mode === 'working' || day.working===true ? false : day.holidayException?.mode === 'off' || (!holiday&&day.working===false) ? true : normallyOff;
 
     if (!policy.includeWeekendsInLeaveDays && weekend) {
@@ -120,7 +121,8 @@ async function previousYearCarryForward(employeeId, leaveType, year, rule) {
       { fromDate: null, date: { $gte: start, $lt: end } }
     ]
   }).lean();
-  const used = leaves.reduce((sum, row) => sum + leaveDays(row), 0);
+  const automatic = await require("./absence-deduction.service").deductions(employeeId,previous,await getExistingUsage(employeeId,null,start,end));
+  const used = leaves.reduce((sum, row) => sum + leaveDays(row), 0) + automatic.filter(l=>String(l.leaveTypeId)===String(leaveType._id)).reduce((sum,l)=>sum+l.days,0);
   const unused = Math.max(0, await annualAllocation(employeeId, leaveType, previous) - used);
   const typeLimit = leaveType.carryForwardLimitDays;
   const globalLimit = Number(rule.carryForwardLimitDays || 0);
@@ -142,10 +144,12 @@ async function getEmployeeLeaveBalances(employeeId, year = new Date().getFullYea
     employeeLeaveRule(employeeId, y)
   ]);
 
+  const automatic = await require("./absence-deduction.service").deductions(employeeId,y,leaves);
   const rows = [];
   for (const type of types) {
     const matching = leaves.filter(l => String(l.leaveTypeId || '') === String(type._id));
-    const used = matching.filter(l => l.status === 'APPROVED').reduce((sum, l) => sum + leaveDays(l), 0);
+    const automaticDays = automatic.filter(l=>String(l.leaveTypeId)===String(type._id)).reduce((sum,l)=>sum+l.days,0);
+    const used = matching.filter(l => l.status === 'APPROVED').reduce((sum, l) => sum + leaveDays(l), 0) + automaticDays;
     const pending = matching.filter(l => l.status === 'PENDING').reduce((sum, l) => sum + leaveDays(l), 0);
     const baseAllocated = await annualAllocation(employeeId, type, y);
     const carryForward = await previousYearCarryForward(employeeId, type, y, rule);
@@ -161,6 +165,8 @@ async function getEmployeeLeaveBalances(employeeId, year = new Date().getFullYea
       carryForward,
       allocated,
       used,
+      automaticDays,
+      automaticDates: automatic.filter(l=>String(l.leaveTypeId)===String(type._id)).map(l=>({date:l.day,days:l.days})),
       pending,
       remaining,
       availableWithNegativeLimit: remaining + negativeLimit,
@@ -185,6 +191,7 @@ async function getEmployeeLeaveBalances(employeeId, year = new Date().getFullYea
     year: y,
     employeeId: String(employeeId),
     balances: rows,
+    automaticDeductions: automatic,
     totals,
     anyExhausted: rows.some(r => r.exhausted),
     allExhausted: rows.length > 0 && rows.every(r => r.exhausted)
@@ -226,7 +233,9 @@ async function assertLeaveAvailable(employeeId, leaveType, requestedDays, status
     getExistingUsage(employeeId, leaveType, start, end, options.excludeLeaveId),
     employeeLeaveRule(employeeId, year)
   ]);
-  const used = existing.filter(l => l.status === 'APPROVED').reduce((s, l) => s + leaveDays(l), 0);
+  const allExisting = await getExistingUsage(employeeId, null, start, end);
+  const automatic = await require('./absence-deduction.service').deductions(employeeId,year,allExisting);
+  const used = existing.filter(l => l.status === 'APPROVED').reduce((s, l) => s + leaveDays(l), 0) + automatic.filter(l=>String(l.leaveTypeId)===String(leaveType._id)).reduce((s,l)=>s+l.days,0);
   const pending = existing.filter(l => l.status === 'PENDING').reduce((s, l) => s + leaveDays(l), 0);
   const carryForward = await previousYearCarryForward(employeeId, leaveType, year, rule);
   const allocated = await annualAllocation(employeeId, leaveType, year) + carryForward;
@@ -311,7 +320,8 @@ async function validateLeaveRequest({
   requestedStatus = 'PENDING',
   excludeLeaveId = null,
   documentSubmitted = false,
-  isAdminGrant = false
+  isAdminGrant = false,
+  deductBalance = true
 }) {
   const [rule, employee] = await Promise.all([
     employeeLeaveRule(employeeId, new Date(fromDate).getFullYear()),
@@ -320,7 +330,7 @@ async function validateLeaveRequest({
   if (!employee) throw errorWith('EMPLOYEE_NOT_FOUND', 'Employee not found', 404);
   if (!leaveType) throw errorWith('LEAVE_TYPE_REQUIRED', 'Select one of the configured leave types.', 400);
 
-  const policy = effectiveLeavePolicy(rule, leaveType);
+  const policy = {...effectiveLeavePolicy(rule, leaveType), includeWeekendsInLeaveDays:false, includeHolidaysInLeaveDays:false};
   const from = startOfDay(fromDate);
   const to = startOfDay(toDate);
   const today = startOfDay(new Date());
@@ -388,7 +398,7 @@ async function validateLeaveRequest({
   await assertMinimumGap(employeeId, from, to, Number(rule.minimumGapBetweenLeaveDays || 0), excludeLeaveId);
 
   const { start: monthStart, end: monthEnd } = monthBounds(from);
-  if (Number(policy.maxLeaveDaysPerMonth || 0) > 0) {
+  if (deductBalance && Number(policy.maxLeaveDaysPerMonth || 0) > 0) {
     const monthly = await getExistingUsage(employeeId, null, monthStart, monthEnd, excludeLeaveId);
     const usedMonth = monthly.reduce((sum, row) => sum + leaveDays(row), 0);
     if (usedMonth + calculated.days - Number(policy.maxLeaveDaysPerMonth) > 1e-9) {
@@ -396,7 +406,7 @@ async function validateLeaveRequest({
     }
   }
 
-  if (Number(policy.maxLeaveDaysPerYear || 0) > 0) {
+  if (deductBalance && Number(policy.maxLeaveDaysPerYear || 0) > 0) {
     const { start: yearStart, end: yearEnd } = yearBounds(from.getFullYear());
     const yearly = await getExistingUsage(employeeId, null, yearStart, yearEnd, excludeLeaveId);
     const usedYear = yearly.reduce((sum, row) => sum + leaveDays(row), 0);
@@ -405,7 +415,7 @@ async function validateLeaveRequest({
     }
   }
 
-  const balance = leaveType
+  const balance = leaveType && deductBalance
     ? await assertLeaveAvailable(employeeId, leaveType, calculated.days, requestedStatus, { excludeLeaveId, fromDate: from })
     : { enforced: false };
 
