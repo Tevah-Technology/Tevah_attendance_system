@@ -1,3 +1,4 @@
+const { withAttendanceDisplay } = require('../utils/attendance-time-display');
 const crypto = require('crypto');
 const { config, createDevice } = require('../config/zkteco');
 const { Attendance, Employee, Shift, Rule, RejectedPunch, EmployeePunchLock } = require('../models');
@@ -499,7 +500,7 @@ async function getTodayStatus(employeeId) {
   const lunchReturnWarning = afterLunch && morningIN && !active;
   const overtimeSessionActive = !hoursOnly && active && lastPunchToday?.punchType === 'IN' &&
     new Date(lastPunchToday.timestamp) >= boundaries.shiftEnd;
-  return {
+  return withAttendanceDisplay({
     employeeId: employee.employeeId,
     attendanceDate: require('../utils/employee-time').labelKey(statusDay),
     timezone: employee.timezone || null,
@@ -536,7 +537,7 @@ async function getTodayStatus(employeeId) {
     latePenaltyApplied: reportRow?.latePenaltyApplied || false,
     attendancePolicy: policy,
     attendanceRule
-  };
+  });
 }
 // Refresh only the latest punch for each employee; do not update already-closed sessions.
 // A changed noon toggle takes effect without restarting the backend.

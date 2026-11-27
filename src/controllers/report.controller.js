@@ -1,3 +1,4 @@
+const { withAttendanceDisplay } = require('../utils/attendance-time-display');
 const {allowDates}=require('../utils/attendance-access');
 const { buildReport, aggregate } = require('../services/report.service');
 const { toExcel, toCsv, toPdf } = require('../utils/export');
@@ -518,7 +519,8 @@ async function monthly(req, res) {
         code = Number(row.lateMinutes || 0) > 0 ? 'LT' : 'P';
       }
 
-      employee.daily.push({
+      employee.daily.push(withAttendanceDisplay({
+        timezone: row.timezone,
         day,
         date: row.date,
         code,
@@ -541,7 +543,7 @@ async function monthly(req, res) {
         earlyDepartureMinutes: Number(row.earlyDepartureMinutes || 0),
         consecutiveLateCount: Number(row.consecutiveLateCount || 0),
         latePenaltyApplied: Boolean(row.latePenaltyApplied),
-      });
+      }));
 
       employee.workMinutes += Number(row.workedMinutes || 0);
       employee.creditedMinutes += Number(row.creditedMinutes || 0);

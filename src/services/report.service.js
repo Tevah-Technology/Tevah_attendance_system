@@ -1,3 +1,4 @@
+const { withAttendanceDisplay } = require('../utils/attendance-time-display');
 const {
   Employee,
   Attendance,
@@ -417,7 +418,7 @@ function makeDaySummary(
     : (clockState === 'CLOCKED_OUT' || clockState === 'NOT_CLOCKED_IN'
         ? false : null);
 
-  return {
+  return withAttendanceDisplay({
     date: startOfDay(date),
     timezone: employee.timezone || null,
     attendanceDate: require('../utils/employee-time').labelKey(date),
@@ -557,7 +558,7 @@ function makeDaySummary(
             )
         }
       : null
-  };
+  });
 }
 
 

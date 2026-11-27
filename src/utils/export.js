@@ -1,14 +1,23 @@
+const { withAttendanceDisplay } = require('./attendance-time-display');
+function display(row, key, suffix) { return row[key+suffix] ? `${row[key+suffix+'Date']} ${row[key+suffix]}` : ''; }
 const XLSX = require('xlsx');
 const PDFDocument = require('pdfkit');
 const { formatMinutes } = require('./time');
 
 function flatten(rows) {
-  return rows.map((row) => ({
+  return rows.map(withRow => { const row = withAttendanceDisplay(withRow); return ({
     Date: new Date(row.date).toISOString().slice(0, 10),
     EmployeeID: row.employeeId,
     EmployeeName: row.employeeName,
     Department: row.department,
     Status: row.status,
+    EmployeeTimezone: row.displayTimezone,
+    FirstInLocal: display(row, "firstIn", "Local"),
+    FirstInIST: display(row, "firstIn", "IST"),
+    LastOutLocal: display(row, "lastOut", "Local"),
+    LastOutIST: display(row, "lastOut", "IST"),
+    AllPunchesLocal: row.punches.map(p => `${display(p,"timestamp","Local")} ${p.punchType}`).join(" | "),
+    AllPunchesIST: row.punches.map(p => `${display(p,"timestamp","IST")} ${p.punchType}`).join(" | "),
     FirstPunch: row.firstPunch ? new Date(row.firstPunch).toLocaleTimeString() : '',
     LastPunch: row.lastPunch ? new Date(row.lastPunch).toLocaleTimeString() : '',
     AllPunches: row.punches.map((p) => `${new Date(p.timestamp).toLocaleTimeString()} ${p.punchType}`).join(' | '),
@@ -24,7 +33,7 @@ function flatten(rows) {
     LateMinutes: row.lateMinutes,
     EarlyDepartureMinutes: row.earlyDepartureMinutes,
     Overtime: formatMinutes(row.overtimeMinutes)
-  }));
+  }); });
 }
 
 function toExcel(rows) {
@@ -55,7 +64,8 @@ function toPdf(rows) {
 
     doc.fontSize(18).text('ZKTeco Attendance Report');
     doc.moveDown();
-    rows.forEach((row) => {
+    rows.forEach((source) => {
+      const row = withAttendanceDisplay(source);
       if (doc.y > 750) doc.addPage();
       doc.fontSize(9).text(
         `${new Date(row.date).toISOString().slice(0, 10)} | ${row.employeeId} | ${row.employeeName} | ${row.status}`
@@ -66,6 +76,9 @@ function toPdf(rows) {
         `Actual: ${formatMinutes(row.workedMinutes)}  Credit: ${formatMinutes(row.creditedMinutes || 0)}  Credited: ${formatMinutes(row.effectiveWorkedMinutes ?? row.workedMinutes)}  Break: ${formatMinutes(row.breakMinutes)}  ` +
         `Late: ${row.lateMinutes}m  Early: ${row.earlyDepartureMinutes}m  OT: ${formatMinutes(row.overtimeMinutes)}`
       );
+      doc.fontSize(8).text(`Employee timezone: ${row.displayTimezone} | IST: Asia/Kolkata`);
+      doc.text(`IN: ${display(row,"firstIn","Local") || "-"} | IST: ${display(row,"firstIn","IST") || "-"}`);
+      doc.text(`OUT: ${display(row,"lastOut","Local") || "-"} | IST: ${display(row,"lastOut","IST") || "-"}`);
       doc.moveDown(0.6);
     });
     doc.end();
