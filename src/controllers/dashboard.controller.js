@@ -93,7 +93,7 @@ async function summary(req, res) {
       req.access?.roleCode === 'SUPER_ADMIN';
 
     // Preserve current behavior: device info is optional if the device is unavailable.
-    const device = canViewDevice
+    const device = canViewDevice && req.query.includeDevice !== 'false'
       ? await timedStep(requestId, 'Device information', async () => {
           try {
             return await deviceService.getInfo();

@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { Compensation, Employee, AuditLog, OvertimeBalance } = require('../models');
+const { Compensation, Employee, AuditLog, OvertimeBalance, EmployeeNotification } = require('../models');
 const { buildReport } = require('../services/report.service');
 const { assertEmployeeAllowed, getAllowedEmployeeIds } = require('../services/access-scope.service');
 
@@ -302,6 +302,10 @@ async function decide(req, res, action) {
         }, { new: true, runValidators: true });
     if (!updated) return failure(res, 409, 'Request was modified by another administrator; refresh');
     await logDecision(req, action, updated);
+    try {
+      const decision = action.toLowerCase();
+      await EmployeeNotification.create({employeeId:updated.employeeId, kind:'compensationDecision', title:`Compensation ${decision}`, message:`Your compensation request has been ${decision}.${reason ? ' Reason: ' + reason : ''}`, metadata:{compensationId:String(updated._id),status:action}});
+    } catch (error) { console.error('In-app compensation notice failed:',error.message); }
     return res.json({ success: true, compensation: updated });
   } catch (e) {
     if (e.code === 11000) return failure(res, 409, 'Another approved hour credit already exists for the target date');

@@ -50,6 +50,7 @@ router.post('/auth/logout', auth.logout);
 // Public self-registration: no Bearer token required.
 router.post('/auth/register', auth.register);
 router.use(authenticate);
+router.get('/realtime/wait', (req, res, next) => require('../services/realtime.service').wait(req, res).catch(next));
 router.get('/auth/me', auth.me);
 router.put('/auth/change-password', auth.changePassword);
 router.get('/me/permissions', role.myPermissions);

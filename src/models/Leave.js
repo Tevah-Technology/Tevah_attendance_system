@@ -6,6 +6,7 @@ const leaveSchema = new mongoose.Schema({
   date: { type: Date, required: true, index: true },
   fromDate: { type: Date, default: null, index: true },
   toDate: { type: Date, default: null, index: true },
+  deductBalance: { type: Boolean, default: true },
   days: { type: Number, default: 1, min: 0 },
   type: { type: String, default: 'Leave' },
   leaveTypeId: { type: mongoose.Schema.Types.ObjectId, ref: 'LeaveType', default: null },
